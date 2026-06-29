@@ -149,7 +149,7 @@ function cmdNoop() {
  * stop: 现在仅"投递"一条 pending 记录到队列，立即返回 {}。
  *  - 不再调用 transcript / session 读取（避免 sidecar 异步写延迟阻塞 kiro-cli）
  *  - 不再 drain 缓冲（postToolUse/preToolUse 缓冲文件由 delayedCollect 接管）
- *  - 真正的采集由主服务侧的 KiroCliSessionInput 延迟 30s 触发 cmdDelayedCollect
+ *  - 真正的采集由主服务侧的 KiroCliDelayedCollectInput 延迟 30s 触发 cmdDelayedCollect
  *
  * 入队字段：cwd / stop 时刻 / 两条 offset 快照 / assistant_response / userId。
  */
@@ -184,7 +184,7 @@ function cmdStop() {
 }
 
 /**
- * cmdDelayedCollect: 主服务侧 KiroCliSessionInput 在 pending 成熟后调起。
+ * cmdDelayedCollect: 主服务侧 KiroCliDelayedCollectInput 在 pending 成熟后调起。
  * argv: node kiro-cli-hook-processor.mjs delayedCollect <pending-file> [--allow-fallback]
  *
  * 读取 pending 记录中的快照 (cwd / sinceMs / sessionSinceMs / assistantResponse / userId)，

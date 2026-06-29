@@ -343,7 +343,7 @@ export function saveTurnCount(cwd, count) {
 // stop hook 触发时把元信息（cwd / 时间 / offset / assistant_response）作为一个
 // 文件投递到 PENDING_STOPS_DIR/ready/，立即返回 {}，不阻塞 kiro-cli。
 //
-// 主服务侧的 KiroCliSessionInput 每 30s 轮询此目录：
+// 主服务侧的 KiroCliDelayedCollectInput 每 30s 轮询此目录：
 //   - 满足成熟条件（now - stop_unix_ms >= MATURE_MS）→ rename 到 inflight/，
 //     调用 delayedCollect 子命令把成熟样本转成 hook JSONL；成功后删除文件。
 //   - 未成熟 → 跳过，下一轮再试。

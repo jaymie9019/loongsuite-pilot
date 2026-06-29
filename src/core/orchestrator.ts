@@ -38,7 +38,7 @@ import { CursorHookInput } from '../inputs/cursor-hook/cursor-hook-input.js';
 import { ClaudeCodeLogInput } from '../inputs/claude-code-log/claude-code-log-input.js';
 import { CodexTranscriptInput } from '../inputs/codex-transcript/codex-transcript-input.js';
 import { KiroCliLogInput } from '../inputs/kiro-cli-log/kiro-cli-log-input.js';
-import { KiroCliSessionInput } from '../inputs/kiro-cli-session/kiro-cli-session-input.js';
+import { KiroCliDelayedCollectInput } from '../inputs/kiro-cli-session/kiro-cli-session-input.js';
 import { OpenCodeLogInput } from '../inputs/opencode-log/opencode-log-input.js';
 import { QwenCodeCliLogInput } from '../inputs/qwen-code-cli-log/qwen-code-cli-log-input.js';
 import { WukongInput } from '../inputs/wukong/wukong-input.js';
@@ -897,8 +897,8 @@ export class Orchestrator extends EventEmitter {
       'hooks',
       'kiro-cli-hook-processor.mjs',
     );
-    const kiroCliSessionWatchPaths = KiroCliSessionInput.getWatchPaths(this.dataDir);
-    const kiroCliSessionInput = new KiroCliSessionInput({
+    const kiroCliSessionWatchPaths = KiroCliDelayedCollectInput.getWatchPaths(this.dataDir);
+    const kiroCliSessionInput = new KiroCliDelayedCollectInput({
       stateStore: this.stateStore,
       hookProcessorPath: kiroCliHookProcessorPath,
       dataDir: this.dataDir,
@@ -908,7 +908,7 @@ export class Orchestrator extends EventEmitter {
     entries.push(
       this.inputManager.buildDetectionEntry(kiroCliSessionInput, {
         watchPaths: kiroCliSessionWatchPaths,
-        isAvailable: async () => KiroCliSessionInput.checkAvailability(kiroCliHookProcessorPath),
+        isAvailable: async () => KiroCliDelayedCollectInput.checkAvailability(kiroCliHookProcessorPath),
         enabled: () => this.isAgentGatedEnabled(Orchestrator.LISTENER_AGENT_MAP['kiro-cli-session']) &&
           this.agentControlManager.resolveEnabled(
             'kiro-cli-session',

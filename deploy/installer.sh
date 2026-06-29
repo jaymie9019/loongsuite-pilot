@@ -34,6 +34,10 @@ PACKAGE_NAME="loongsuite-pilot"
 PERMANENT_DIR="$HOME/.loongsuite-pilot/package"
 DEFAULT_DATA_DIR="$HOME/.loongsuite-pilot"
 
+# Minimum supported Node.js major version. Referenced from both
+# _node_usable (per-candidate probe) and the post-resolve version gate.
+MIN_NODE_MAJOR=18
+
 # Channel presets: release (production) vs test (pre-release)
 _RELEASE_BASE_URL="https://aliyun-observability-release-cn-shanghai.oss-cn-shanghai.aliyuncs.com/loongsuite-pilot"
 _TEST_BASE_URL="https://aliyun-observability-release-cn-shanghai.oss-cn-shanghai.aliyuncs.com/loongsuite-pilot-dev"
@@ -263,7 +267,7 @@ _node_is_suitable() {
     ver="$("$bin" --version 2>/dev/null)" || return 1
     local major="${ver#v}"
     major="${major%%.*}"
-    [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 18 )) || return 1
+    [[ "$major" =~ ^[0-9]+$ ]] && (( major >= MIN_NODE_MAJOR )) || return 1
     return 0
 }
 
@@ -307,9 +311,9 @@ check_deps() {
     }
 
     NODE_MAJOR=$("$NODE_BIN" -e "process.stdout.write(String(process.versions.node.split('.')[0]))")
-    if [ "$NODE_MAJOR" -lt 18 ]; then
-        msg "❌ 需要 Node.js >= 18，当前版本: $("$NODE_BIN" --version)" \
-            "❌ Requires Node.js >= 18, current: $("$NODE_BIN" --version)"
+    if [ "$NODE_MAJOR" -lt "$MIN_NODE_MAJOR" ]; then
+        msg "❌ 需要 Node.js >= $MIN_NODE_MAJOR，当前版本: $("$NODE_BIN" --version)" \
+            "❌ Requires Node.js >= $MIN_NODE_MAJOR, current: $("$NODE_BIN" --version)"
         exit 1
     fi
 
@@ -560,6 +564,8 @@ for (const c of changed) {
 }
 " -- "$config_file" "$(printf '{"slsEndpoint":"%s","slsProject":"%s","slsLogstore":"%s","cmsLicenseKey":"%s","cmsEndpoint":"%s","cmsWorkspace":"%s","serviceNamePrefix":"%s","maskMode":"%s","maskTypes":"%s"}' \
         "$SLS_ENDPOINT" "$SLS_PROJECT" "$SLS_LOGSTORE" "$CMS_LICENSE_KEY" "$CMS_ENDPOINT" "$CMS_WORKSPACE" "$SERVICE_NAME_PREFIX" "$MASK_MODE" "$MASK_TYPES")" 2>/dev/null || true)
+    # read-probe: `2>/dev/null || true` is intentional — diff display is
+    # best-effort; a JS error here must not block the install.
 
     if [ -z "$diffs" ]; then return 0; fi
 
@@ -816,6 +822,12 @@ if (selectedAgents) {
 
 fs.writeFileSync(path, JSON.stringify(config, null, 2) + '\n');
 " -- "$PROBE_RESULT"
+    local write_rc=$?
+    if [ "$write_rc" -ne 0 ]; then
+        msg "    ❌ 配置写入失败 (exit $write_rc)，请检查上方 stderr" \
+            "    ❌ Failed to write config (exit $write_rc); see stderr above"
+        return 1
+    fi
     msg "    ✅ 配置已写入" "    ✅ Config written"
     echo ""
 }
@@ -1409,8 +1421,11 @@ remove_hook_configs() {
         local short="${cfg/#$HOME/\~}"
 
         local ok=0
+        local err_msg=""
         if command -v node &>/dev/null; then
-            node -e "
+            # write-edit: surface JS failures to stderr instead of `|| true`.
+            # Capture stderr only; stdout ('cleaned'/'skip') is discarded.
+            err_msg=$(node -e "
 const fs = require('fs');
 const cfg = process.argv[1];
 const marker = process.argv[2];
@@ -1438,13 +1453,18 @@ try {
     process.stdout.write('skip');
   }
 } catch(e) { process.stderr.write(e.message); process.exit(1); }
-" "$cfg" "$HOOK_MARKER" && ok=1
+" "$cfg" "$HOOK_MARKER" 2>&1 >/dev/null) && ok=1
         fi
 
         if [ "$ok" -eq 1 ]; then
             msg "    ✅ 已清理: $short" "    ✅ Cleaned: $short"
+        elif [ -n "$err_msg" ]; then
+            # JS threw — surface the message so the failure is observable.
+            msg "    ❌ 清理失败: $short — ${err_msg:0:200}" \
+                "    ❌ Clean failed: $short — ${err_msg:0:200}"
         else
-            msg "    ⚠️  跳过: $short (需手动清理)" "    ⚠️  Skipped: $short (manual cleanup needed)"
+            msg "    ⚠️  跳过: $short (未安装 node，需手动清理)" \
+                "    ⚠️  Skipped: $short (node not installed, manual cleanup needed)"
         fi
     done
 }

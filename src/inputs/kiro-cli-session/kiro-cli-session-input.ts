@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * KiroCliSessionInput — delayed sidecar scan scheduler for Kiro CLI.
+ * KiroCliDelayedCollectInput — scheduler, not a session reader.
  *
  * Background
  *   Kiro CLI's interactive sessions write timing data into a sidecar JSON file
@@ -41,7 +41,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { ClientType, CollectionMethod } from '../../types/index.js';
 import type { AgentActivityEntry } from '../../types/index.js';
-import { resolveHome, directoryExists } from '../../utils/fs-utils.js';
+import { resolveHome } from '../../utils/fs-utils.js';
 import { BaseInput, type InputOptions } from '../base/base-input.js';
 
 const DEFAULT_MATURE_DELAY_MS = 30_000;
@@ -49,7 +49,7 @@ const DEFAULT_MAX_AGE_MS = 5 * 60 * 1000;
 const DEFAULT_SUBPROCESS_TIMEOUT_MS = 60_000;
 const DEFAULT_MAX_CONCURRENT_PROCESSES = 4;
 
-export interface KiroCliSessionInputOptions extends InputOptions {
+export interface KiroCliDelayedCollectInputOptions extends InputOptions {
   /** Absolute path to the hook processor mjs (e.g. <pilotDir>/hooks/kiro-cli-hook-processor.mjs). */
   hookProcessorPath: string;
   /** Root data directory (e.g. ~/.loongsuite-pilot). */
@@ -80,7 +80,7 @@ interface PendingItem {
   record: PendingRecord;
 }
 
-export class KiroCliSessionInput extends BaseInput {
+export class KiroCliDelayedCollectInput extends BaseInput {
   readonly id = 'kiro-cli-session';
   readonly agentType = ClientType.KiroCli;
   readonly collectionMethod = CollectionMethod.HookJsonl;
@@ -93,7 +93,7 @@ export class KiroCliSessionInput extends BaseInput {
   private readonly subprocessTimeoutMs: number;
   private readonly maxConcurrent: number;
 
-  constructor(opts: KiroCliSessionInputOptions) {
+  constructor(opts: KiroCliDelayedCollectInputOptions) {
     super({
       stateStore: opts.stateStore,
       pollIntervalMs: opts.pollIntervalMs ?? 30_000,
@@ -132,6 +132,17 @@ export class KiroCliSessionInput extends BaseInput {
     }
   }
 
+  /**
+   * This input never emits entries — it returns `[]` so that `BaseInput`'s
+   * poll loop is a no-op for downstream emission. The real records flow out
+   * through {@link KiroCliLogInput}, which reads the daily hook-jsonl that
+   * the `delayedCollect` subprocess appends to. The `[]` return here is the
+   * intended side-channel: we only schedule subprocesses and let
+   * `KiroCliLogInput` surface the results on its own poll cadence.
+   *
+   * Debug logs are emitted per pending item so the side-channel is
+   * observable in `pilot.log` (claim / spawn / status / release).
+   */
   protected async collect(): Promise<AgentActivityEntry[]> {
     await this.ensureDirs();
     const items = await this.listReady();
@@ -147,6 +158,11 @@ export class KiroCliSessionInput extends BaseInput {
     }
     if (due.length === 0) return [];
 
+    this.logger.debug('kiro-cli delayedCollect scheduling pending items', {
+      ready: items.length,
+      due: due.length,
+      now,
+    });
     await Promise.all(due.map((item) => this.processOne(item, now)));
     // This input never emits entries; downstream visibility comes from
     // KiroCliLogInput reading the daily-jsonl appended by the subprocess.
@@ -155,15 +171,30 @@ export class KiroCliSessionInput extends BaseInput {
 
   private async processOne(item: PendingItem, nowMs: number): Promise<void> {
     const claimed = await this.claim(item.readyPath);
-    if (!claimed) return; // someone else (or restart cleanup) took it
+    if (!claimed) {
+      this.logger.debug('kiro-cli delayedCollect claim lost', {
+        readyPath: item.readyPath,
+      });
+      return; // someone else (or restart cleanup) took it
+    }
 
     const stopMs = item.record.stopUnixMs ?? item.record.enqueueMs ?? nowMs;
     const allowFallback = nowMs - stopMs >= this.maxAgeMs;
     const args: string[] = ['delayedCollect', claimed];
     if (allowFallback) args.push('--allow-fallback');
 
+    this.logger.debug('kiro-cli delayedCollect spawning subprocess', {
+      inflight: claimed,
+      ageMs: nowMs - stopMs,
+      allowFallback,
+    });
+
     try {
       const status = await this.spawnProcessor(args);
+      this.logger.debug('kiro-cli delayedCollect subprocess done', {
+        inflight: claimed,
+        status,
+      });
       if (status === 'ok' || status === 'no_data') {
         await this.discardInflight(claimed);
       } else if (status === 'timing_pending') {
@@ -317,6 +348,3 @@ function parseStatus(stdout: string): string {
   }
   return 'unknown';
 }
-
-// Re-export to satisfy `directoryExists` import if needed elsewhere.
-export { directoryExists };
