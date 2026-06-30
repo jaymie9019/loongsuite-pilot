@@ -59,12 +59,12 @@ describe('OtlpTraceFlusher - augmentToolSpans (S1b fix)', () => {
     await flusher.shutdown();
   });
 
-  it('error result: sets status=error + tool.error JSON + tool.output=error.message', () => {
+  it('error result: sets status + tool.error JSON + tool.output=error.message (feeds normalized failure)', () => {
     const records = [
       {
         'event.name': 'tool.result',
         'gen_ai.tool.call.id': 'call-1',
-        'tool.result.status': 'error',
+        'tool.result.status': 'failure',
         'error.type': 'ToolError',
         'error.message': 'exit_status 2: ls: cannot access /tmp/no-such-dir: No such file or directory',
       },
@@ -74,7 +74,7 @@ describe('OtlpTraceFlusher - augmentToolSpans (S1b fix)', () => {
     (flusher as any).augmentToolSpans(records, spans);
 
     const attrs = spans[0].attributes;
-    expect(attrs['gen_ai.tool.call.status']).toBe('error');
+    expect(attrs['gen_ai.tool.call.status']).toBe('failure');
     const err = JSON.parse(attrs['gen_ai.tool.error'] as string);
     expect(err.type).toBe('ToolError');
     expect(err.message).toContain('exit_status 2');
@@ -121,7 +121,7 @@ describe('OtlpTraceFlusher - augmentToolSpans (S1b fix)', () => {
       {
         'event.name': 'tool.result',
         'gen_ai.tool.call.id': 'call-3',
-        'tool.result.status': 'error',
+        'tool.result.status': 'failure',
         'error.type': 'ToolError',
         'error.message': 'boom',
       },
@@ -134,12 +134,12 @@ describe('OtlpTraceFlusher - augmentToolSpans (S1b fix)', () => {
     expect(llmSpan.attributes['gen_ai.tool.output']).toBeUndefined();
   });
 
-  it('error without error.type/error.message: falls back to ToolError / empty', () => {
+  it('error without error.type/error.message: falls back to ToolError / empty (feeds normalized failure)', () => {
     const records = [
       {
         'event.name': 'tool.result',
         'gen_ai.tool.call.id': 'call-4',
-        'tool.result.status': 'error',
+        'tool.result.status': 'failure',
       },
     ] as unknown as AgentActivityEntry[];
     const spans = [makeToolSpan('call-4', 'some-result')];
@@ -147,7 +147,7 @@ describe('OtlpTraceFlusher - augmentToolSpans (S1b fix)', () => {
     (flusher as any).augmentToolSpans(records, spans);
 
     const attrs = spans[0].attributes;
-    expect(attrs['gen_ai.tool.call.status']).toBe('error');
+    expect(attrs['gen_ai.tool.call.status']).toBe('failure');
     const err = JSON.parse(attrs['gen_ai.tool.error'] as string);
     expect(err.type).toBe('ToolError');
     expect(err.message).toBe('');

@@ -423,7 +423,7 @@ export class OtlpTraceFlusher extends BaseFlusher {
       const info = toolResultByCallId.get(callId);
       const status = info?.status ?? 'success';
       attrs['gen_ai.tool.call.status'] = status;
-      if (status === 'error') {
+      if (status !== 'success') {
         const errorObj = {
           type: info?.errorType ?? 'ToolError',
           message: info?.errorMessage ?? '',
