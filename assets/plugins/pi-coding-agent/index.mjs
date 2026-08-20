@@ -370,7 +370,9 @@ function turnFields(ctx, state, runtime, timestamp = Date.now()) {
     'gen_ai.agent.name': identity.agentName,
     'gen_ai.agent.system': identity.agentSystem,
     'gen_ai.framework': identity.framework,
-    [`agent.${identity.agentType}.cwd`]: ctx.cwd,
+    ...(identity.agentType === 'omp' && !state.captureContent
+      ? {}
+      : { [`agent.${identity.agentType}.cwd`]: ctx.cwd }),
     ...resourceBaseFieldPatch,
     ...resourceAttributeFields,
   };

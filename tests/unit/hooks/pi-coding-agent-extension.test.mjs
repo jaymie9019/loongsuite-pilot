@@ -443,7 +443,13 @@ describe('Pi Coding Agent extension', () => {
 
     it('keeps identity and hash while content capture is disabled', async () => {
       const skill = installSkill('private-skill');
-      const runtime = await createRuntime(skillTelemetryConfig(false), undefined, { activeSkills: [skill] });
+      const runtime = await createRuntime(skillTelemetryConfig(false), {
+        agentType: 'omp',
+        agentId: 'omp',
+        agentName: 'Oh My Pi',
+        agentSystem: 'pi',
+        framework: 'pi-coding-agent',
+      }, { activeSkills: [skill] });
       await startTurn(runtime);
       await runtime.emit('message_start', {
         message: {
@@ -460,7 +466,9 @@ describe('Pi Coding Agent extension', () => {
       expect(record['gen_ai.skill.name']).toBe('private-skill');
       expect(record['gen_ai.skill.version']).toMatch(/^sha256:/);
       expect(record).not.toHaveProperty('gen_ai.skill.description');
+      expect(record).not.toHaveProperty('agent.omp.cwd');
       expect(JSON.stringify(record)).not.toContain(skill.filePath);
+      expect(JSON.stringify(record)).not.toContain('/workspace/example');
       expect(JSON.stringify(record)).not.toContain('top secret instructions');
     });
 
