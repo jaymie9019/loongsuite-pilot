@@ -17,6 +17,7 @@ import {
   agentBaseFieldPatch,
   collectResourceAttributesFromEnv,
 } from '../shared/resource-context.mjs';
+import { createPiSkillTelemetryAdapter } from './skill-telemetry.mjs';
 
 const LOG_PREFIX = 'pi-coding-agent';
 export const PI_TELEMETRY_PLUGIN_API_VERSION = 1;
@@ -436,15 +437,20 @@ export function createPiTelemetryExtension(identityOptions = {}) {
     userInputEmitted: false,
     toolStarts: new Map(),
   };
+  const skillTelemetry = createPiSkillTelemetryAdapter({
+    emitRecord: writeRecord,
+    reportError: writeError,
+  });
 
   const resetSessionConfig = () => {
     const config = loadPilotConfig();
     state.userId = resolveUserId(config);
     state.captureContent = shouldCaptureContent(config, identity.agentType);
+    return config;
   };
 
   pi.on('session_start', safeHandler('session_start', async () => {
-    resetSessionConfig();
+    const config = resetSessionConfig();
     state.traceId = null;
     state.turnId = null;
     state.stepId = null;
@@ -454,10 +460,17 @@ export function createPiTelemetryExtension(identityOptions = {}) {
     state.pendingUserInput = [];
     state.userInputEmitted = false;
     state.toolStarts.clear();
+    await skillTelemetry.configure({
+      pi,
+      config,
+      agentType: identity.agentType,
+      captureContent: state.captureContent,
+      resetSession: true,
+    });
   }));
 
   pi.on('before_agent_start', safeHandler('before_agent_start', async (event) => {
-    resetSessionConfig();
+    const config = resetSessionConfig();
     state.traceId = traceId();
     state.turnId = crypto.randomUUID();
     state.stepId = null;
@@ -468,6 +481,20 @@ export function createPiTelemetryExtension(identityOptions = {}) {
     state.pendingUserInput = promptInputMessages(event);
     state.userInputEmitted = false;
     state.toolStarts.clear();
+    await skillTelemetry.configure({
+      pi,
+      config,
+      agentType: identity.agentType,
+      captureContent: state.captureContent,
+    });
+  }));
+
+  pi.on('message_start', safeHandler('message_start', async (event, ctx) => {
+    await skillTelemetry.onMessageStart(
+      event,
+      ctx,
+      timestamp => commonFields(ctx, state, runtime, timestamp),
+    );
   }));
 
   pi.on('turn_start', safeHandler('turn_start', async (event) => {
@@ -574,6 +601,7 @@ export function createPiTelemetryExtension(identityOptions = {}) {
   pi.on('tool_execution_start', safeHandler('tool_execution_start', async (event, ctx) => {
     const startedAt = timestampMillis();
     state.toolStarts.set(event.toolCallId, startedAt);
+    skillTelemetry.onToolStart(event);
     const record = {
       ...commonFields(ctx, state, runtime, startedAt),
       'event.name': 'tool.call',
@@ -596,6 +624,7 @@ export function createPiTelemetryExtension(identityOptions = {}) {
       'gen_ai.tool.name': event.toolName,
       'gen_ai.tool.call.id': event.toolCallId,
       'tool.result.status': event.isError ? 'error' : 'success',
+      ...skillTelemetry.onToolEnd(event),
     };
     if (startedAt !== undefined) {
       record['gen_ai.tool.call.duration'] = endedAt - startedAt;
@@ -610,6 +639,7 @@ export function createPiTelemetryExtension(identityOptions = {}) {
   pi.on('session_shutdown', safeHandler('session_shutdown', async () => {
     state.pendingUserInput = [];
     state.toolStarts.clear();
+    skillTelemetry.shutdown();
   }));
   };
 }

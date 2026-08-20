@@ -42,7 +42,7 @@ afterEach(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-async function createRuntime(config = {}, identity) {
+async function createRuntime(config = {}, identity, runtimeOptions = {}) {
   fs.writeFileSync(path.join(tmpDir, 'config.json'), JSON.stringify(config));
   const handlers = new Map();
   const api = {
@@ -59,7 +59,14 @@ async function createRuntime(config = {}, identity) {
         { name: 'write', description: 'Write a file', parameters: { type: 'object' } },
       ];
     },
+    getCommands: runtimeOptions.getCommands ?? (() => []),
   };
+  if (runtimeOptions.includePiNamespace !== false) {
+    api.pi = {
+      getActiveSkills: runtimeOptions.getActiveSkills
+        ?? (() => runtimeOptions.activeSkills ?? []),
+    };
+  }
   const mod = await import(`${pathToFileURL(EXTENSION_PATH).href}?t=${Date.now()}_${Math.random()}`);
   const extension = identity ? mod.createPiTelemetryExtension(identity) : mod.default;
   extension(api);
@@ -79,6 +86,37 @@ async function createRuntime(config = {}, identity) {
   }
 
   return { emit };
+}
+
+function installSkill(name, content = `---\nname: ${name}\ndescription: Test skill\n---\n\n# ${name}\n`) {
+  const baseDir = path.join(tmpDir, 'skills', name);
+  const filePath = path.join(baseDir, 'SKILL.md');
+  fs.mkdirSync(baseDir, { recursive: true });
+  fs.writeFileSync(filePath, content);
+  return {
+    name,
+    description: `${name} description`,
+    filePath,
+    baseDir,
+    source: 'test',
+    hide: false,
+  };
+}
+
+function skillTelemetryConfig(captureMessageContent = true) {
+  return {
+    agents: {
+      'pi-coding-agent': {
+        captureMessageContent,
+        skillTelemetry: {
+          enabled: true,
+          mode: 'exact',
+          versionStrategy: 'content_sha256',
+          weakPathHeuristics: false,
+        },
+      },
+    },
+  };
 }
 
 function readRecords() {
@@ -111,6 +149,299 @@ async function startTurn(runtime) {
 }
 
 describe('Pi Coding Agent extension', () => {
+  describe('Skill telemetry', () => {
+    it('emits one synthetic load_skill TOOL for a user skill-prompt and deduplicates replay', async () => {
+      const skill = installSkill('projex-ticket');
+      const runtime = await createRuntime(skillTelemetryConfig(), undefined, { activeSkills: [skill] });
+      await startTurn(runtime);
+      const event = {
+        message: {
+          role: 'custom',
+          customType: 'skill-prompt',
+          attribution: 'user',
+          timestamp: Date.now(),
+          details: { name: skill.name, path: skill.filePath, lineCount: 12 },
+          content: 'private Skill body',
+        },
+      };
+
+      await runtime.emit('message_start', event);
+      await runtime.emit('message_start', event);
+
+      const records = readRecords();
+      expect(records).toHaveLength(2);
+      expect(records.map(record => record['event.name'])).toEqual(['tool.call', 'tool.result']);
+      expect(records[0]).toMatchObject({
+        'gen_ai.tool.name': 'load_skill',
+        'gen_ai.tool.type': 'extension',
+        'gen_ai.skill.id': 'projex-ticket',
+        'gen_ai.skill.name': 'projex-ticket',
+        'gen_ai.skill.description': 'projex-ticket description',
+        'loongsuite.skill.trigger': 'user_command',
+        'loongsuite.skill.provenance': 'skill_prompt',
+        'loongsuite.skill.confidence': 'direct',
+        'loongsuite.skill.revision_source': 'observed_file',
+      });
+      expect(records[0]['gen_ai.skill.version']).toMatch(/^sha256:[0-9a-f]{12}$/);
+      expect(records[0]['loongsuite.skill.content_sha256']).toMatch(/^[0-9a-f]{64}$/);
+      expect(records[0]['gen_ai.tool.call.id']).toBe(records[1]['gen_ai.tool.call.id']);
+      expect(records[0]).not.toHaveProperty('gen_ai.tool.call.arguments');
+      expect(JSON.stringify(records)).not.toContain(skill.filePath);
+
+      const conversion = await convertEventLogToReadableSpans(records);
+      const toolSpans = conversion.spans.filter(span => span.attributes['gen_ai.span.kind'] === 'TOOL');
+      expect(toolSpans).toHaveLength(1);
+      expect(toolSpans[0].attributes['gen_ai.skill.name']).toBe('projex-ticket');
+    });
+
+    it('labels non-user skill-prompt injection without claiming exact autoload', async () => {
+      const skill = installSkill('roster');
+      const runtime = await createRuntime(skillTelemetryConfig(), undefined, { activeSkills: [skill] });
+      await startTurn(runtime);
+      await runtime.emit('message_start', {
+        message: {
+          role: 'custom',
+          customType: 'skill-prompt',
+          attribution: 'agent',
+          timestamp: Date.now(),
+          details: { name: skill.name, path: skill.filePath },
+        },
+      });
+
+      expect(readRecords()[0]).toMatchObject({
+        'loongsuite.skill.trigger': 'agent_injected',
+        'loongsuite.skill.provenance': 'skill_prompt',
+      });
+    });
+
+    it('ignores malformed skill-prompt details', async () => {
+      const runtime = await createRuntime(skillTelemetryConfig());
+      await startTurn(runtime);
+      await runtime.emit('message_start', {
+        message: {
+          role: 'custom',
+          customType: 'skill-prompt',
+          attribution: 'user',
+          details: { name: 'unsafe\nname', path: '/tmp/not-a-skill.txt' },
+        },
+      });
+      expect(() => readRecords()).toThrow();
+    });
+
+    it.each(['skill://roster', 'skill://roster/SKILL.md'])(
+      'enriches the existing Read TOOL for canonical root URI %s',
+      async requestedPath => {
+        const skill = installSkill('roster');
+        const runtime = await createRuntime(skillTelemetryConfig(), undefined, { activeSkills: [skill] });
+        await startTurn(runtime);
+        await runtime.emit('tool_execution_start', {
+          toolCallId: 'call-skill-root',
+          toolName: 'read',
+          args: { path: requestedPath },
+        });
+        await runtime.emit('tool_execution_end', {
+          toolCallId: 'call-skill-root',
+          toolName: 'read',
+          result: { content: '# roster', details: { resolvedPath: skill.filePath } },
+          isError: false,
+        });
+
+        const records = readRecords();
+        expect(records).toHaveLength(2);
+        expect(records[0]).not.toHaveProperty('gen_ai.skill.name');
+        expect(records[1]).toMatchObject({
+          'gen_ai.tool.name': 'read',
+          'gen_ai.tool.call.id': 'call-skill-root',
+          'gen_ai.skill.name': 'roster',
+          'loongsuite.skill.trigger': 'model_read',
+          'loongsuite.skill.provenance': 'explicit_skill_uri',
+        });
+
+        const conversion = await convertEventLogToReadableSpans(records);
+        const toolSpans = conversion.spans.filter(span => span.attributes['gen_ai.span.kind'] === 'TOOL');
+        expect(toolSpans).toHaveLength(1);
+      },
+    );
+
+    it('does not count Skill resource reads or Bash text as activation', async () => {
+      const skill = installSkill('roster');
+      const resourcePath = path.join(skill.baseDir, 'references', 'api.md');
+      fs.mkdirSync(path.dirname(resourcePath), { recursive: true });
+      fs.writeFileSync(resourcePath, '# API');
+      const runtime = await createRuntime(skillTelemetryConfig(), undefined, { activeSkills: [skill] });
+      await startTurn(runtime);
+      await runtime.emit('tool_execution_start', {
+        toolCallId: 'call-resource',
+        toolName: 'read',
+        args: { path: 'skill://roster/references/api.md' },
+      });
+      await runtime.emit('tool_execution_end', {
+        toolCallId: 'call-resource',
+        toolName: 'read',
+        result: { details: { resolvedPath: resourcePath } },
+        isError: false,
+      });
+      await runtime.emit('tool_execution_start', {
+        toolCallId: 'call-bash',
+        toolName: 'bash',
+        args: { command: 'echo skill://roster' },
+      });
+      await runtime.emit('tool_execution_end', {
+        toolCallId: 'call-bash',
+        toolName: 'bash',
+        result: { output: 'skill://roster' },
+        isError: false,
+      });
+
+      expect(readRecords()).toHaveLength(4);
+      expect(readRecords().some(record => record['gen_ai.skill.name'] !== undefined)).toBe(false);
+    });
+
+    it('uses an exact catalog root path but not another file under the Skill directory', async () => {
+      const skill = installSkill('roster');
+      const otherPath = path.join(skill.baseDir, 'references.md');
+      fs.writeFileSync(otherPath, '# references');
+      const runtime = await createRuntime(skillTelemetryConfig(), undefined, { activeSkills: [skill] });
+      await startTurn(runtime);
+      await runtime.emit('tool_execution_start', {
+        toolCallId: 'call-exact-path',
+        toolName: 'read',
+        args: { path: skill.filePath },
+      });
+      await runtime.emit('tool_execution_end', {
+        toolCallId: 'call-exact-path',
+        toolName: 'read',
+        result: { details: { resolvedPath: skill.filePath } },
+        isError: false,
+      });
+      await runtime.emit('tool_execution_start', {
+        toolCallId: 'call-nearby-path',
+        toolName: 'read',
+        args: { path: otherPath },
+      });
+      await runtime.emit('tool_execution_end', {
+        toolCallId: 'call-nearby-path',
+        toolName: 'read',
+        result: { details: { resolvedPath: otherPath } },
+        isError: false,
+      });
+
+      const results = readRecords().filter(record => record['event.name'] === 'tool.result');
+      expect(results[0]['gen_ai.skill.name']).toBe('roster');
+      expect(results[0]['loongsuite.skill.provenance']).toBe('catalog_exact_path');
+      expect(results[1]).not.toHaveProperty('gen_ai.skill.name');
+    });
+
+    it('keeps Skill identity on an explicit root Read error', async () => {
+      const skill = installSkill('roster');
+      const runtime = await createRuntime(skillTelemetryConfig(), undefined, { activeSkills: [skill] });
+      await startTurn(runtime);
+      await runtime.emit('tool_execution_start', {
+        toolCallId: 'call-error',
+        toolName: 'read',
+        args: { path: 'skill://roster' },
+      });
+      await runtime.emit('tool_execution_end', {
+        toolCallId: 'call-error',
+        toolName: 'read',
+        result: { content: 'not found' },
+        isError: true,
+      });
+
+      expect(readRecords()[1]).toMatchObject({
+        'tool.result.status': 'error',
+        'error.type': 'tool_error',
+        'gen_ai.skill.name': 'roster',
+      });
+    });
+
+    it('fails closed when the catalog is unavailable or ambiguous', async () => {
+      const first = installSkill('duplicate', '# first');
+      const secondBase = path.join(tmpDir, 'other-skills', 'duplicate');
+      fs.mkdirSync(secondBase, { recursive: true });
+      const second = { ...first, filePath: path.join(secondBase, 'SKILL.md'), baseDir: secondBase };
+      fs.writeFileSync(second.filePath, '# second');
+      const runtime = await createRuntime(skillTelemetryConfig(), undefined, {
+        activeSkills: [first, second],
+      });
+      await startTurn(runtime);
+      await runtime.emit('tool_execution_start', {
+        toolCallId: 'call-ambiguous',
+        toolName: 'read',
+        args: { path: 'skill://duplicate' },
+      });
+      await runtime.emit('tool_execution_end', {
+        toolCallId: 'call-ambiguous',
+        toolName: 'read',
+        result: {},
+        isError: false,
+      });
+      expect(readRecords()[1]).not.toHaveProperty('gen_ai.skill.name');
+
+      const missingCatalogRuntime = await createRuntime(skillTelemetryConfig(), undefined, {
+        getActiveSkills: () => { throw new Error('catalog unavailable'); },
+      });
+      await startTurn(missingCatalogRuntime);
+      await missingCatalogRuntime.emit('tool_execution_start', {
+        toolCallId: 'call-no-catalog',
+        toolName: 'read',
+        args: { path: 'skill://missing' },
+      });
+      await missingCatalogRuntime.emit('tool_execution_end', {
+        toolCallId: 'call-no-catalog',
+        toolName: 'read',
+        result: {},
+        isError: false,
+      });
+      expect(readRecords().find(record => record['gen_ai.tool.call.id'] === 'call-no-catalog'))
+        .not.toHaveProperty('gen_ai.skill.name');
+    });
+
+    it('keeps identity and hash while content capture is disabled', async () => {
+      const skill = installSkill('private-skill');
+      const runtime = await createRuntime(skillTelemetryConfig(false), undefined, { activeSkills: [skill] });
+      await startTurn(runtime);
+      await runtime.emit('message_start', {
+        message: {
+          role: 'custom',
+          customType: 'skill-prompt',
+          attribution: 'user',
+          timestamp: Date.now(),
+          details: { name: skill.name, path: skill.filePath },
+          content: 'top secret instructions',
+        },
+      });
+
+      const record = readRecords()[0];
+      expect(record['gen_ai.skill.name']).toBe('private-skill');
+      expect(record['gen_ai.skill.version']).toMatch(/^sha256:/);
+      expect(record).not.toHaveProperty('gen_ai.skill.description');
+      expect(JSON.stringify(record)).not.toContain(skill.filePath);
+      expect(JSON.stringify(record)).not.toContain('top secret instructions');
+    });
+
+    it('omits version when the observed Skill file cannot be read', async () => {
+      const skill = installSkill('gone-skill');
+      const runtime = await createRuntime(skillTelemetryConfig(), undefined, { activeSkills: [skill] });
+      await startTurn(runtime);
+      fs.unlinkSync(skill.filePath);
+      await runtime.emit('message_start', {
+        message: {
+          role: 'custom',
+          customType: 'skill-prompt',
+          attribution: 'user',
+          timestamp: Date.now(),
+          details: { name: skill.name, path: skill.filePath },
+        },
+      });
+
+      const record = readRecords()[0];
+      expect(record['gen_ai.skill.name']).toBe('gone-skill');
+      expect(record).not.toHaveProperty('gen_ai.skill.version');
+      expect(record).not.toHaveProperty('loongsuite.skill.content_sha256');
+    });
+  });
+
   it('binds registered PI SDK Agent identity while keeping the shared log protocol', async () => {
     const runtime = await createRuntime({
       agents: {
