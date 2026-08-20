@@ -83,10 +83,16 @@ LoongSuite Pilot 会将采集到的活动归一化为 GenAI 遥测事件。Pilot
 | `gen_ai.tool.call.arguments` | json | Opt-In | 工具调用参数，可能包含敏感内容。 |
 | `gen_ai.tool.call.result` | json | Opt-In | 工具结果 payload，可能包含敏感内容。 |
 | `gen_ai.tool.call.duration` | int | Recommended | 使用匹配的 result 边界减去 call 边界得到的正数工具执行耗时，单位毫秒；任一边界缺失或差值非正时省略。 |
-| `gen_ai.skill.name` | string | `skill.use` Conditionally Required | 技能或扩展能力名称。 |
-| `gen_ai.skill.id` | string | 技能标识可用时 Recommended | 稳定的技能标识。 |
+| `gen_ai.skill.name` | string | `skill.use` 或 Skill load TOOL Conditionally Required | 技能或扩展能力名称。 |
+| `gen_ai.skill.id` | string | Skill 标识可用时 Recommended | 稳定的 Skill 标识。 |
 | `gen_ai.skill.description` | string | 技能元数据可用时 Recommended | 技能描述。 |
 | `gen_ai.skill.version` | string | 技能元数据可用时 Recommended | 技能版本。 |
+| `loongsuite.skill.activation_id` | string | OMP exact Skill telemetry Recommended | 一次确认 activation 的稳定关联 ID。 |
+| `loongsuite.skill.trigger` | string | OMP exact Skill telemetry Recommended | `user_command`、`agent_injected` 或 `model_read`。 |
+| `loongsuite.skill.provenance` | string | OMP exact Skill telemetry Recommended | activation 的结构化证据来源。 |
+| `loongsuite.skill.confidence` | string | OMP exact Skill telemetry Recommended | `direct` 或 `exact_match`。 |
+| `loongsuite.skill.content_sha256` | string | Skill 根文件可读时 Recommended | detection 时观测到的根 `SKILL.md` 完整 SHA-256。 |
+| `loongsuite.skill.revision_source` | string | version 可用时 Recommended | revision 来源；当前为 `observed_file`。 |
 | `error.type` | string | 操作以错误结束时 Conditionally Required | 低基数错误类型、错误码、异常类名或 HTTP 状态。 |
 | `error.message` | string | `error.type` 存在时 Recommended | 人类可读错误详情。 |
 | `agent.channel` | string | Recommended | 请求来源渠道，例如 `ide_plugin`、`web` 或 `api`。 |
@@ -96,6 +102,11 @@ LoongSuite Pilot 会将采集到的活动归一化为 GenAI 遥测事件。Pilot
 | `workspace.current_root` | string | Recommended | Git 顶层目录，仅当工作目录是 git 仓库时推断得出。 |
 | `workspace.path` | string | Recommended | agent 进程实际运行的工作目录（cwd），与 git 无关。即使目录不是 git 仓库也会带上。 |
 | `agent.*` | json | Opt-In | Agent-specific 扩展属性。稳定且高频查询的维度应逐步沉淀为结构化字段。 |
+
+工作目录自动采集覆盖 Claude Code、Codex、Cursor / Cursor CLI、Kiro CLI、MiMo Code、OpenClaw、OpenCode、Pi Coding Agent、Qoder 系列、Qoder Work / Qoder Work CN、Qwen Code CLI、Qwen Work CN 和 WorkBuddy。该上下文不属于消息内容；即使对应 Agent 配置了 `captureMessageContent: false`，`workspace.*` 和可推断的 `git.*` 字段也会保留。
+
+OMP exact Skill telemetry 将 Skill load 记录为 TOOL，而不是要求额外的 `skill.use`。完整的识别、
+隐私和 revision 语义见 [Pi Coding Agent / OMP Skill telemetry](pi-coding-agent-skill-telemetry.md)。
 
 ## 多模态消息 Parts
 

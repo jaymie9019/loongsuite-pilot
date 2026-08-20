@@ -21,7 +21,7 @@
 | MiMo Code | `mimo-code` | 插件注入，采集 LLM、工具和 Token 生命周期事件。 |
 | OpenClaw | `openclaw` | 注入插件，支持 OpenClaw 2026.5.12 及以上稳定版本；采集原生 LLM、ReAct、工具、Token、错误和取消事件。 |
 | OpenCode | `opencode` | 插件注入。 |
-| Pi Coding Agent | `pi-coding-agent` | 注入 Pi Extension，采集 LLM 与工具生命周期事件。 |
+| Pi Coding Agent | `pi-coding-agent` | 注入 Pi Extension，采集 LLM 与工具生命周期事件；OMP 可选启用 [exact Skill telemetry](pi-coding-agent-skill-telemetry.md)。 |
 | Qoder | `qoder` | Hook 集成。 |
 | Qoder CN | `qoder-cn` | Hook 集成。 |
 | Qoder for JetBrains | `qoder-jetbrains` | 部署/检测专用 ID。`agent-control.json` 中采集开关为 `qoder`；`config.json` 中内容策略为 `qoder-idea`。 |
@@ -155,6 +155,7 @@ loongsuite-pilot restart
 | `enabled` | 设置为 `false` 可从配置层禁用该 Agent。 |
 | `captureMessageContent` | 设置为 `false` 可避免采集完整 Prompt、Completion、工具参数和工具结果，前提是对应集成支持该策略。 |
 | `multimodal.uploadMode` | 多模态上传策略。`none`（默认）关闭；`input` / `tool` / `output` / `both` 控制转换表面。详见 [多模态采集](multimodal.md)。 |
+| `skillTelemetry` | OMP 的 exact Skill activation 采集策略，默认关闭。详见 [Pi Coding Agent / OMP Skill telemetry](pi-coding-agent-skill-telemetry.md)。 |
 
 敏感环境建议同时设置 `captureMessageContent: false` 和 [数据脱敏](masking.md)。需要提取多模态数据时，见 [多模态采集](multimodal.md)（当前仅图像、仅 `codex` 生效）。
 

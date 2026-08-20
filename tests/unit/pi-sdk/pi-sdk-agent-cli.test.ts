@@ -35,6 +35,10 @@ describe('PI SDK Agent CLI', () => {
       path.join(piTarget, 'index.mjs'),
     );
     await fs.copyFile(
+      path.join(process.cwd(), 'assets', 'plugins', 'pi-coding-agent', 'skill-telemetry.mjs'),
+      path.join(piTarget, 'skill-telemetry.mjs'),
+    );
+    await fs.copyFile(
       path.join(process.cwd(), 'assets', 'plugins', 'shared', 'resource-context.mjs'),
       path.join(sharedTarget, 'resource-context.mjs'),
     );
