@@ -203,10 +203,18 @@ export interface AgentMultimodalConfig {
   uploadMode: MultimodalUploadMode;
 }
 
+export interface AgentSkillTelemetryConfig {
+  enabled: boolean;
+  mode: 'exact';
+  versionStrategy: 'content_sha256';
+  weakPathHeuristics: boolean;
+}
+
 export interface AgentConfig {
   enabled?: boolean;
   captureMessageContent: boolean;
   multimodal?: AgentMultimodalConfig;
+  skillTelemetry?: AgentSkillTelemetryConfig;
 }
 
 export type AgentsConfig = Record<string, AgentConfig>;

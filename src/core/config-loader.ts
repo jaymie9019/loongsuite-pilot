@@ -13,6 +13,7 @@ import type {
   MaskConfig,
   MaskType,
   AgentMultimodalConfig,
+  AgentSkillTelemetryConfig,
   MultimodalOssConfig,
   MultimodalRuntimeConfig,
   MultimodalSlsConfig,
@@ -185,6 +186,12 @@ export interface ConfigFile {
     captureMessageContent?: boolean | string;
     multimodal?: {
       uploadMode?: string;
+    };
+    skillTelemetry?: {
+      enabled?: boolean | string;
+      mode?: string;
+      versionStrategy?: string;
+      weakPathHeuristics?: boolean | string;
     };
   }>;
 
@@ -456,14 +463,40 @@ function buildAgentsConfig(file: ConfigFile | null): AgentsConfig {
     if (!agentType || !policy || typeof policy !== 'object') continue;
     const captureMessageContent = parseOptionalBool(policy.captureMessageContent) ?? true;
     const multimodal = buildAgentMultimodalConfig(policy.multimodal);
+    const skillTelemetry = buildAgentSkillTelemetryConfig(policy.skillTelemetry);
     result[agentType] = {
       enabled: policy.enabled,
       captureMessageContent,
       ...(multimodal ? { multimodal } : {}),
+      ...(skillTelemetry ? { skillTelemetry } : {}),
     };
   }
 
   return result;
+}
+
+function buildAgentSkillTelemetryConfig(
+  block: {
+    enabled?: boolean | string;
+    mode?: string;
+    versionStrategy?: string;
+    weakPathHeuristics?: boolean | string;
+  } | undefined,
+): AgentSkillTelemetryConfig | undefined {
+  if (!block || typeof block !== 'object') return undefined;
+  const exactMode = block.mode === undefined || block.mode === 'exact';
+  const contentHashVersion = block.versionStrategy === undefined
+    || block.versionStrategy === 'content_sha256';
+  const weakPathHeuristics = parseOptionalBool(block.weakPathHeuristics) ?? false;
+  return {
+    enabled: (parseOptionalBool(block.enabled) ?? false)
+      && exactMode
+      && contentHashVersion
+      && !weakPathHeuristics,
+    mode: 'exact',
+    versionStrategy: 'content_sha256',
+    weakPathHeuristics,
+  };
 }
 
 function buildAgentMultimodalConfig(

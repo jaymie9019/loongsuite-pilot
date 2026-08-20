@@ -7,6 +7,7 @@ const CANONICAL_PREFIXES = [
   'gen_ai.',
   'git.',
   'host.',
+  'loongsuite.',
   'service.',
   'workspace.',
 ];
