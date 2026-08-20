@@ -212,6 +212,12 @@ describe('OtlpTraceFlusher - conversion', () => {
         'gen_ai.tool.call.id': 'skill-call-1',
         'gen_ai.skill.description': 'Exploratory QA for web apps.',
         'gen_ai.skill.version': '1.0.0',
+        'loongsuite.skill.activation_id': 'skill-activation-1',
+        'loongsuite.skill.trigger': 'model_read',
+        'loongsuite.skill.provenance': 'explicit_skill_uri',
+        'loongsuite.skill.confidence': 'direct',
+        'loongsuite.skill.content_sha256': 'a'.repeat(64),
+        'loongsuite.skill.revision_source': 'observed_file',
       },
     ] as unknown as AgentActivityEntry[];
     const toolSpan = {
@@ -234,6 +240,12 @@ describe('OtlpTraceFlusher - conversion', () => {
       'gen_ai.skill.id': 'dogfood',
       'gen_ai.skill.description': 'Exploratory QA for web apps.',
       'gen_ai.skill.version': '1.0.0',
+      'loongsuite.skill.activation_id': 'skill-activation-1',
+      'loongsuite.skill.trigger': 'model_read',
+      'loongsuite.skill.provenance': 'explicit_skill_uri',
+      'loongsuite.skill.confidence': 'direct',
+      'loongsuite.skill.content_sha256': 'a'.repeat(64),
+      'loongsuite.skill.revision_source': 'observed_file',
     });
     expect(llmSpan.attributes).not.toHaveProperty('gen_ai.skill.name');
   });
@@ -420,6 +432,26 @@ describe('OtlpTraceFlusher - conversion', () => {
         expect.arrayContaining(['multica.issue.id', 'multica.user.id', 'git.repo']),
       );
       expect(opts.passthroughKeys).not.toContain('other.key');
+    });
+
+    it('always passes through LoongSuite Skill diagnostics', async () => {
+      p = new OtlpTraceFlusher(makeConfig());
+      const entry = {
+        'event.name': 'llm.response',
+        'gen_ai.agent.type': 'omp',
+        'gen_ai.turn.id': 'skill-turn',
+        'gen_ai.response.finish_reasons': ['stop'],
+        'loongsuite.skill.activation_id': 'skill-activation-1',
+        'loongsuite.skill.provenance': 'skill_prompt',
+      } as unknown as AgentActivityEntry;
+
+      await p.send(entry);
+
+      const opts = vi.mocked(convertEventLogToTrace).mock.calls.at(-1)![1] as { passthroughKeys?: string[] };
+      expect(opts.passthroughKeys).toEqual(expect.arrayContaining([
+        'loongsuite.skill.activation_id',
+        'loongsuite.skill.provenance',
+      ]));
     });
 
     it('does not pass through any prefix key when none is configured', async () => {

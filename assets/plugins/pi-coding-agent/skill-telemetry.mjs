@@ -90,7 +90,7 @@ export function createPiSkillTelemetryAdapter({ emitRecord, reportError }) {
 
     const catalogMatch = uniqueMatch(state.byPath.get(observedPath));
     if (catalogMatch && catalogMatch.name !== name) return;
-    if (!catalogMatch && state.byName.has(name) && !uniqueMatch(state.byName.get(name))) return;
+    if (!catalogMatch && state.byName.has(name)) return;
 
     const startedAt = timestampMillis(message.timestamp ?? event?.timestamp ?? Date.now());
     const sessionId = ctx?.sessionManager?.getSessionId?.();
@@ -212,24 +212,38 @@ function resolveSkillTelemetryConfig(config, agentType) {
   const configured = config?.agents?.[agentType]?.skillTelemetry
     ?? config?.agents?.['pi-coding-agent']?.skillTelemetry;
   return {
-    enabled: configured?.enabled === true && (configured.mode ?? 'exact') === 'exact',
+    enabled: parseConfigBool(configured?.enabled) === true
+      && (configured?.mode ?? 'exact') === 'exact'
+      && (configured?.versionStrategy ?? 'content_sha256') === 'content_sha256'
+      && parseConfigBool(configured?.weakPathHeuristics) !== true,
   };
 }
 
 async function readActiveSkills(pi) {
   if (typeof pi?.pi?.getActiveSkills === 'function') {
     const value = await pi.pi.getActiveSkills();
-    return arrayValue(value);
+    const skills = arrayValue(value);
+    if (skills.length > 0) return skills;
   }
   if (typeof pi?.getActiveSkills === 'function') {
     const value = await pi.getActiveSkills();
-    return arrayValue(value);
+    const skills = arrayValue(value);
+    if (skills.length > 0) return skills;
   }
   if (typeof pi?.getCommands === 'function') {
     const commands = arrayValue(await pi.getCommands());
     return commands.filter(command => command?.source === 'skill');
   }
   return [];
+}
+
+function parseConfigBool(value) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'true') return true;
+  if (normalized === 'false') return false;
+  return undefined;
 }
 
 function arrayValue(value) {
@@ -330,7 +344,11 @@ function canonicalFilePath(value) {
   try {
     return fs.realpathSync.native(absolute);
   } catch {
-    return path.normalize(absolute);
+    try {
+      return path.join(fs.realpathSync.native(path.dirname(absolute)), path.basename(absolute));
+    } catch {
+      return path.normalize(absolute);
+    }
   }
 }
 

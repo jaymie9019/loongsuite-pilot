@@ -134,6 +134,57 @@ describe('PiCodingAgentLogInput', () => {
     expect(secondEntries).toHaveLength(0);
   });
 
+  it('preserves Skill identity and exact-evidence diagnostics during normalization', async () => {
+    const today = new Date();
+    const date = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+    const hash = 'a'.repeat(64);
+    await fs.writeFile(path.join(tmpDir, `pi-coding-agent-${date}.jsonl`), `${JSON.stringify({
+      'event.name': 'tool.result',
+      'gen_ai.session.id': 'omp-session',
+      'gen_ai.turn.id': 'omp-turn',
+      'gen_ai.agent.type': 'omp',
+      'gen_ai.agent.id': 'omp',
+      'gen_ai.agent.name': 'Oh My Pi',
+      'gen_ai.agent.system': 'pi',
+      'gen_ai.framework': 'pi-coding-agent',
+      'gen_ai.tool.name': 'read',
+      'gen_ai.tool.call.id': 'skill-call-1',
+      'tool.result.status': 'success',
+      'gen_ai.skill.id': 'roster',
+      'gen_ai.skill.name': 'roster',
+      'gen_ai.skill.description': 'Resolve users.',
+      'gen_ai.skill.version': 'sha256:aaaaaaaaaaaa',
+      'loongsuite.skill.activation_id': 'skill-call-1',
+      'loongsuite.skill.trigger': 'model_read',
+      'loongsuite.skill.provenance': 'explicit_skill_uri',
+      'loongsuite.skill.confidence': 'direct',
+      'loongsuite.skill.content_sha256': hash,
+      'loongsuite.skill.revision_source': 'observed_file',
+    })}\n`);
+
+    const input = new PiCodingAgentLogInput({ stateStore: stateStore as never, logDir: tmpDir });
+    const entries: AgentActivityEntry[] = [];
+    input.on('entries', batch => entries.push(...batch));
+    await input.start();
+    await input.stop();
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      'gen_ai.agent.type': 'omp',
+      'gen_ai.agent.id': 'omp',
+      'gen_ai.agent.name': 'Oh My Pi',
+      'gen_ai.skill.id': 'roster',
+      'gen_ai.skill.name': 'roster',
+      'gen_ai.skill.version': 'sha256:aaaaaaaaaaaa',
+      'loongsuite.skill.activation_id': 'skill-call-1',
+      'loongsuite.skill.trigger': 'model_read',
+      'loongsuite.skill.provenance': 'explicit_skill_uri',
+      'loongsuite.skill.confidence': 'direct',
+      'loongsuite.skill.content_sha256': hash,
+      'loongsuite.skill.revision_source': 'observed_file',
+    });
+  });
+
   it('preserves the registered PI SDK Agent identity from canonical records', async () => {
     const today = new Date();
     const date = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;

@@ -51,7 +51,14 @@ const SKILL_ATTRIBUTE_KEYS = [
   'gen_ai.skill.id',
   'gen_ai.skill.description',
   'gen_ai.skill.version',
+  'loongsuite.skill.activation_id',
+  'loongsuite.skill.trigger',
+  'loongsuite.skill.provenance',
+  'loongsuite.skill.confidence',
+  'loongsuite.skill.content_sha256',
+  'loongsuite.skill.revision_source',
 ] as const;
+const BUILT_IN_SPAN_ATTRIBUTE_PASSTHROUGH_PREFIXES = ['loongsuite.skill.'] as const;
 
 interface TurnBuffer {
   key: string;
@@ -214,9 +221,12 @@ export class OtlpTraceFlusher extends BaseFlusher {
     this.resourceAttributeKeys = (cfg.resourceAttributeKeys ?? [])
       .map(key => key.trim())
       .filter(key => key.length > 0);
-    this.spanAttributePassthroughPrefixes = (cfg.spanAttributePassthroughPrefixes ?? [])
-      .map(prefix => prefix.trim())
-      .filter(prefix => prefix.length > 0);
+    this.spanAttributePassthroughPrefixes = [...new Set([
+      ...BUILT_IN_SPAN_ATTRIBUTE_PASSTHROUGH_PREFIXES,
+      ...(cfg.spanAttributePassthroughPrefixes ?? [])
+        .map(prefix => prefix.trim())
+        .filter(prefix => prefix.length > 0),
+    ])];
 
     if (cfg.captureMessageContent !== false) {
       process.env.OTEL_SEMCONV_STABILITY_OPT_IN ??= 'gen_ai_latest_experimental';

@@ -228,6 +228,25 @@ describe('Pi Coding Agent extension', () => {
       expect(() => readRecords()).toThrow();
     });
 
+    it('rejects a structured Skill prompt whose path disagrees with the catalog', async () => {
+      const skill = installSkill('roster');
+      const runtime = await createRuntime(skillTelemetryConfig(), undefined, { activeSkills: [skill] });
+      await startTurn(runtime);
+      await runtime.emit('message_start', {
+        message: {
+          role: 'custom',
+          customType: 'skill-prompt',
+          attribution: 'user',
+          timestamp: Date.now(),
+          details: {
+            name: skill.name,
+            path: path.join(tmpDir, 'stale', skill.name, 'SKILL.md'),
+          },
+        },
+      });
+      expect(() => readRecords()).toThrow();
+    });
+
     it.each(['skill://roster', 'skill://roster/SKILL.md'])(
       'enriches the existing Read TOOL for canonical root URI %s',
       async requestedPath => {
@@ -395,6 +414,31 @@ describe('Pi Coding Agent extension', () => {
       });
       expect(readRecords().find(record => record['gen_ai.tool.call.id'] === 'call-no-catalog'))
         .not.toHaveProperty('gen_ai.skill.name');
+    });
+
+    it('falls back to a complete Skill command catalog when active skills are unavailable', async () => {
+      const skill = installSkill('command-skill');
+      const runtime = await createRuntime(skillTelemetryConfig(), undefined, {
+        includePiNamespace: false,
+        getCommands: () => [{ ...skill, source: 'skill' }],
+      });
+      await startTurn(runtime);
+      await runtime.emit('tool_execution_start', {
+        toolCallId: 'call-command-catalog',
+        toolName: 'read',
+        args: { path: 'skill://command-skill' },
+      });
+      await runtime.emit('tool_execution_end', {
+        toolCallId: 'call-command-catalog',
+        toolName: 'read',
+        result: { details: { resolvedPath: skill.filePath } },
+        isError: false,
+      });
+
+      expect(readRecords()[1]).toMatchObject({
+        'gen_ai.skill.name': 'command-skill',
+        'loongsuite.skill.provenance': 'explicit_skill_uri',
+      });
     });
 
     it('keeps identity and hash while content capture is disabled', async () => {

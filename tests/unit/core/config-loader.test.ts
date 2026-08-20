@@ -546,6 +546,56 @@ describe('ConfigLoader', () => {
       expect(config.agents.cursor).toEqual({ captureMessageContent: true });
     });
 
+    it('parses exact per-agent Skill telemetry policy', async () => {
+      mockReadJsonFile.mockResolvedValueOnce({
+        agents: {
+          omp: {
+            captureMessageContent: false,
+            skillTelemetry: {
+              enabled: 'true',
+              mode: 'exact',
+              versionStrategy: 'content_sha256',
+              weakPathHeuristics: 'false',
+            },
+          },
+        },
+      });
+
+      const config = await loadConfig();
+      expect(config.agents.omp).toEqual({
+        captureMessageContent: false,
+        skillTelemetry: {
+          enabled: true,
+          mode: 'exact',
+          versionStrategy: 'content_sha256',
+          weakPathHeuristics: false,
+        },
+      });
+    });
+
+    it('fails closed for unsupported Skill telemetry policies', async () => {
+      mockReadJsonFile.mockResolvedValueOnce({
+        agents: {
+          omp: {
+            skillTelemetry: {
+              enabled: true,
+              mode: 'heuristic',
+              versionStrategy: 'mtime',
+              weakPathHeuristics: true,
+            },
+          },
+        },
+      });
+
+      const config = await loadConfig();
+      expect(config.agents.omp?.skillTelemetry).toEqual({
+        enabled: false,
+        mode: 'exact',
+        versionStrategy: 'content_sha256',
+        weakPathHeuristics: true,
+      });
+    });
+
     it('defaults agent multimodal uploadMode to none', async () => {
       mockReadJsonFile.mockResolvedValueOnce({
         agents: {
