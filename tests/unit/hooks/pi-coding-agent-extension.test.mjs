@@ -121,6 +121,7 @@ function skillTelemetryConfig(captureMessageContent = true) {
 
 function readRecords() {
   const dir = path.join(tmpDir, 'logs', 'pi-coding-agent');
+  if (!fs.existsSync(dir)) return [];
   return fs.readdirSync(dir)
     .filter(name => name.endsWith('.jsonl'))
     .flatMap(name => fs.readFileSync(path.join(dir, name), 'utf8').trim().split('\n'))
@@ -150,22 +151,21 @@ async function startTurn(runtime) {
 
 describe('Pi Coding Agent extension', () => {
   describe('Skill telemetry', () => {
-    it('emits one synthetic load_skill TOOL for a user skill-prompt and deduplicates replay', async () => {
+    it('emits one synthetic load_skill TOOL for a persisted OMP skill-prompt and deduplicates replay', async () => {
       const skill = installSkill('projex-ticket');
       const runtime = await createRuntime(skillTelemetryConfig(), undefined, { activeSkills: [skill] });
       await startTurn(runtime);
       const event = {
-        message: {
-          role: 'custom',
-          customType: 'skill-prompt',
-          attribution: 'user',
-          timestamp: Date.now(),
-          details: { name: skill.name, path: skill.filePath, lineCount: 12 },
-          content: 'private Skill body',
-        },
+        type: 'custom_message',
+        customType: 'skill-prompt',
+        attribution: 'user',
+        timestamp: '2026-08-20T14:13:50.055Z',
+        details: { name: skill.name, path: skill.filePath, lineCount: 12 },
+        content: 'private Skill body',
       };
 
       await runtime.emit('message_start', event);
+      vi.setSystemTime(new Date('2026-07-16T09:00:00.000Z'));
       await runtime.emit('message_start', event);
 
       const records = readRecords();
@@ -225,7 +225,7 @@ describe('Pi Coding Agent extension', () => {
           details: { name: 'unsafe\nname', path: '/tmp/not-a-skill.txt' },
         },
       });
-      expect(() => readRecords()).toThrow();
+      expect(readRecords()).toEqual([]);
     });
 
     it('rejects a structured Skill prompt whose path disagrees with the catalog', async () => {
@@ -244,7 +244,7 @@ describe('Pi Coding Agent extension', () => {
           },
         },
       });
-      expect(() => readRecords()).toThrow();
+      expect(readRecords()).toEqual([]);
     });
 
     it.each(['skill://roster', 'skill://roster/SKILL.md'])(

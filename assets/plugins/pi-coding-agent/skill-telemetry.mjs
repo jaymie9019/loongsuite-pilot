@@ -80,7 +80,8 @@ export function createPiSkillTelemetryAdapter({ emitRecord, reportError }) {
   async function onMessageStart(event, ctx, makeFields) {
     if (!state.enabled) return;
     const message = event?.message ?? event;
-    if (message?.role !== 'custom' || message?.customType !== 'skill-prompt') return;
+    const isCustomMessage = message?.role === 'custom' || message?.type === 'custom_message';
+    if (!isCustomMessage || message?.customType !== 'skill-prompt') return;
     const details = message.details;
     const name = normalizeSkillName(details?.name);
     const observedPath = canonicalFilePath(details?.path);
@@ -378,7 +379,12 @@ function normalizeCallId(value) {
 }
 
 function timestampMillis(timestamp = Date.now()) {
-  return Number.isFinite(timestamp) ? Math.trunc(timestamp) : Date.now();
+  if (Number.isFinite(timestamp)) return Math.trunc(timestamp);
+  if (typeof timestamp === 'string') {
+    const parsed = Date.parse(timestamp);
+    if (Number.isFinite(parsed)) return Math.trunc(parsed);
+  }
+  return Date.now();
 }
 
 function timestampStrictlyAfter(timestamp, startedAt) {
