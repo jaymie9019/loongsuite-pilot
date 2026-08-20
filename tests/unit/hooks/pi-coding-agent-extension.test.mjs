@@ -228,23 +228,43 @@ describe('Pi Coding Agent extension', () => {
       expect(readRecords()).toEqual([]);
     });
 
-    it('rejects a structured Skill prompt whose path disagrees with the catalog', async () => {
-      const skill = installSkill('roster');
-      const runtime = await createRuntime(skillTelemetryConfig(), undefined, { activeSkills: [skill] });
+    it('uses the OMP-loaded Skill revision when the catalog has the same name at another cache path', async () => {
+      const catalogSkill = installSkill('projex-ticket', 'catalog cache revision\n');
+      const observedBase = path.join(tmpDir, 'omp-cache', 'plugins', 'projex-ticket');
+      const observedPath = path.join(observedBase, 'SKILL.md');
+      fs.mkdirSync(observedBase, { recursive: true });
+      fs.writeFileSync(observedPath, 'actual OMP cache revision\n');
+      const runtime = await createRuntime(skillTelemetryConfig(), undefined, {
+        activeSkills: [catalogSkill],
+      });
       await startTurn(runtime);
       await runtime.emit('message_start', {
-        message: {
-          role: 'custom',
-          customType: 'skill-prompt',
-          attribution: 'user',
-          timestamp: Date.now(),
-          details: {
-            name: skill.name,
-            path: path.join(tmpDir, 'stale', skill.name, 'SKILL.md'),
-          },
+        type: 'custom_message',
+        customType: 'skill-prompt',
+        attribution: 'user',
+        timestamp: '2026-08-20T15:00:34.318Z',
+        details: {
+          name: catalogSkill.name,
+          path: observedPath,
         },
       });
-      expect(readRecords()).toEqual([]);
+
+      const records = readRecords();
+      expect(records).toHaveLength(2);
+      expect(records[0]).toMatchObject({
+        'event.name': 'tool.call',
+        'gen_ai.tool.name': 'load_skill',
+        'gen_ai.skill.id': 'projex-ticket',
+        'gen_ai.skill.name': 'projex-ticket',
+        'gen_ai.skill.version': 'sha256:973e0a9219af',
+        'loongsuite.skill.content_sha256': '973e0a9219af26bbadaa1365899d039c92f07efe28686e272ed75af59e551962',
+        'loongsuite.skill.provenance': 'skill_prompt',
+        'loongsuite.skill.confidence': 'direct',
+        'loongsuite.skill.revision_source': 'observed_file',
+      });
+      expect(records[0]).not.toHaveProperty('gen_ai.skill.description');
+      expect(records[0]['gen_ai.tool.call.id']).toBe(records[1]['gen_ai.tool.call.id']);
+      expect(JSON.stringify(records)).not.toContain(observedPath);
     });
 
     it.each(['skill://roster', 'skill://roster/SKILL.md'])(

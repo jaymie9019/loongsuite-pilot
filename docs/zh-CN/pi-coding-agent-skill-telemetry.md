@@ -4,7 +4,7 @@
 Skill activation，并将它映射到 AgentLoop 可分析的 OpenTelemetry TOOL span。
 
 当前实现是 Pilot plugin-only exact adapter：不修改 OMP，也不从 system prompt、普通路径或
-Bash 文本猜测 Skill。它只记录能够由结构化事件或 catalog 精确校验的 activation。
+Bash 文本猜测 Skill。它只记录 OMP structured activation 或能够由 catalog 精确校验的 Read。
 
 ## 数据模型
 
@@ -33,8 +33,8 @@ gen_ai.skill.*
 
 | OMP 行为 | 证据 | 输出 |
 |----------|------|------|
-| 用户 `/skill:name` | `message_start` 中 `customType=skill-prompt` 且 `attribution=user` | synthetic `load_skill` TOOL，`trigger=user_command` |
-| OMP 或 subagent 注入 Skill | `message_start` 中 `customType=skill-prompt` 且 attribution 非 `user` | synthetic `load_skill` TOOL，`trigger=agent_injected` |
+| 用户 `/skill:name` | `message_start` 中 `customType=skill-prompt`、合法 name 和根 `SKILL.md` path，且 `attribution=user` | synthetic `load_skill` TOOL，`trigger=user_command` |
+| OMP 或 subagent 注入 Skill | `message_start` 中 `customType=skill-prompt`、合法 name 和根 `SKILL.md` path，且 attribution 非 `user` | synthetic `load_skill` TOOL，`trigger=agent_injected` |
 | `read skill://name` | Read 参数是 canonical root URI，且 active catalog 唯一匹配 | 丰富原 Read TOOL，`trigger=model_read` |
 | `read skill://name/SKILL.md` | 规范化为 root URI，且 active catalog 唯一匹配 | 丰富原 Read TOOL，`trigger=model_read` |
 | 直接读取注册 Skill 的根 `SKILL.md` | tool result 的 `resolvedPath` 精确等于 active catalog 的 canonical file path | 丰富原 Read TOOL，`trigger=model_read` |
@@ -45,7 +45,7 @@ gen_ai.skill.*
 - 仅位于 Skill `baseDir` 内的普通文件；
 - Bash 参数或输出中出现的 `skill://` 文本；
 - 普通文本、system prompt 或任意 `skills/<name>` 路径；
-- catalog 缺失、抛错、同名冲突或 path/name 不一致的事件。
+- catalog 缺失、抛错、同名冲突的 Read，或 catalog 将同一 path 标识成另一个 Skill name 的事件。
 
 这些规则对应三类证据强度：
 
@@ -56,8 +56,10 @@ gen_ai.skill.*
 | heuristic | 普通路径、目录、文本或 Bash 内容推断 | 否 |
 
 Catalog 的来源依次为 `api.pi?.getActiveSkills?.()`、`api.getActiveSkills?.()` 和信息完整的
-`api.getCommands()` Skill command。空的 active list 才会降级到 command catalog。Catalog 只用于
-身份校验，不表示 Skill 已被调用。
+`api.getCommands()` Skill command。空的 active list 才会降级到 command catalog。对于 Read，
+catalog 用于身份校验；对于 structured `skill-prompt`，OMP 实际加载的 name/path 是 direct evidence，
+catalog 仅在 path 精确匹配时补充 description。同名 Skill 的其他 cache path 不会覆盖实际加载的
+revision。Catalog 本身不表示 Skill 已被调用。
 
 ## 字段契约
 

@@ -91,7 +91,6 @@ export function createPiSkillTelemetryAdapter({ emitRecord, reportError }) {
 
     const catalogMatch = uniqueMatch(state.byPath.get(observedPath));
     if (catalogMatch && catalogMatch.name !== name) return;
-    if (!catalogMatch && state.byName.has(name)) return;
 
     const startedAt = timestampMillis(message.timestamp ?? event?.timestamp ?? Date.now());
     const sessionId = ctx?.sessionManager?.getSessionId?.();
