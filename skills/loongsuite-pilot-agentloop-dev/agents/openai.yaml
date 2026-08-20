@@ -1,0 +1,4 @@
+interface:
+  display_name: "LoongSuite Pilot × AgentLoop Dev"
+  short_description: "构建、部署并诊断 Pilot 与 AgentLoop 链路"
+  default_prompt: "Use $loongsuite-pilot-agentloop-dev to safely build, deploy, and diagnose this Pilot-to-AgentLoop change."
