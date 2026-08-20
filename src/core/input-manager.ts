@@ -19,6 +19,8 @@ import type { MultimodalProcessor } from '../multimodal/processor.js';
 import { applyInvocationIdentity } from '../normalization/invocation-identity.js';
 
 const logger = createLogger('InputManager');
+const DROID_FORCED_MASK_CONFIG: MaskConfig = { mode: 'all', types: [] };
+let droidForcedMaskPlan: MaskPlan | undefined;
 
 export interface InputCounter {
   inEvents: number;
@@ -108,20 +110,33 @@ export class InputManager extends EventEmitter {
       type: input.collectionMethod,
       lastActiveTime: 0,
     });
+    // Structural test doubles and third-party embedders may still implement
+    // the pre-1.3 EventEmitter-only shape. Production BaseInput instances use
+    // the awaited sink; retain the event fallback for compatibility.
+    if (typeof input.setEntrySink === 'function') {
+      input.setEntrySink(entries => this.enqueueEntries(input.id, entries));
+    }
+    // Some inputs publish out-of-band batches from file watchers rather than
+    // their collection cycle. Keep that compatibility path fail-open; regular
+    // collect() cycles use the awaited sink above.
     input.on('entries', (entries: AgentActivityEntry[]) => {
-      const previous = this.entryQueues.get(input.id) ?? Promise.resolve();
-      const next = previous
-        .catch(() => undefined)
-        .then(() => this.handleEntries(input.id, entries))
-        .catch(err => {
-          logger.error('entry handling failed', { inputId: input.id, error: String(err) });
-        });
-      this.entryQueues.set(input.id, next);
-      void next.finally(() => {
-        if (this.entryQueues.get(input.id) === next) this.entryQueues.delete(input.id);
+      void this.enqueueEntries(input.id, entries).catch(err => {
+        logger.error('entry handling failed', { inputId: input.id, error: String(err) });
       });
     });
     logger.info('input registered', { id: input.id });
+  }
+
+  private enqueueEntries(inputId: string, entries: AgentActivityEntry[]): Promise<void> {
+    const previous = this.entryQueues.get(inputId) ?? Promise.resolve();
+    const next = previous
+      .catch(() => undefined)
+      .then(() => this.handleEntries(inputId, entries));
+    this.entryQueues.set(inputId, next);
+    void next.finally(() => {
+      if (this.entryQueues.get(inputId) === next) this.entryQueues.delete(inputId);
+    }).catch(() => undefined);
+    return next;
   }
 
   async startInput(id: string): Promise<void> {
@@ -251,7 +266,12 @@ export class InputManager extends EventEmitter {
     // store so agent spans reparent under the upstream span. Fully fail-open.
     if (this.traceLinker) {
       try {
-        await this.traceLinker.stamp(entries);
+        // Droid IDs are the replay/idempotency contract. Reparenting would make
+        // live and replay produce different trace IDs for the same source turn.
+        const linkableEntries = entries.filter(
+          entry => entry['gen_ai.agent.type'] !== 'droid',
+        );
+        if (linkableEntries.length > 0) await this.traceLinker.stamp(linkableEntries);
       } catch (err) {
         logger.warn('trace linker stamp failed (skipped)', { inputId, error: String(err) });
       }
@@ -261,15 +281,25 @@ export class InputManager extends EventEmitter {
       applyAgentContentPolicy(entry, this.agentsConfig),
     );
 
-    const maskedEntries =
-      this.maskPlan.rules.length === 0 && this.maskPlan.piiTypes.size === 0
-        ? policyAppliedEntries
-        : policyAppliedEntries.map(entry =>
-            maskAgentActivityEntry(entry, this.maskConfig, this.maskPlan),
-          );
+    const maskedEntries = policyAppliedEntries.map(entry => {
+      // Droid transcripts contain prompt/tool content read from local disk. If
+      // that content is enabled, it must always pass the complete Pilot mask
+      // plan even when the installation's global mask mode is less strict.
+      // captureMessageContent=false was already applied above and leaves no
+      // content fields to mask.
+      if (entry['gen_ai.agent.type'] === 'droid') {
+        droidForcedMaskPlan ??= loadMaskPlan(DROID_FORCED_MASK_CONFIG);
+        return maskAgentActivityEntry(entry, DROID_FORCED_MASK_CONFIG, droidForcedMaskPlan);
+      }
+      if (this.maskPlan.rules.length === 0 && this.maskPlan.piiTypes.size === 0) return entry;
+      return maskAgentActivityEntry(entry, this.maskConfig, this.maskPlan);
+    });
 
     logger.info('dispatching entries', { inputId, count: maskedEntries.length });
-    await this.dispatchEntries(inputId, maskedEntries, batchBytes);
+    const requireLocalDurableAck = maskedEntries.some(
+      entry => entry['gen_ai.agent.type'] === 'droid',
+    );
+    await this.dispatchEntries(inputId, maskedEntries, batchBytes, requireLocalDurableAck);
   }
 
   markInputStarted(id: string): void {
@@ -279,7 +309,12 @@ export class InputManager extends EventEmitter {
     }
   }
 
-  private async dispatchEntries(inputId: string, entries: AgentActivityEntry[], batchBytes: number): Promise<void> {
+  private async dispatchEntries(
+    inputId: string,
+    entries: AgentActivityEntry[],
+    batchBytes: number,
+    requireLocalDurableAck = false,
+  ): Promise<void> {
     if (!this.flusher) {
       logger.warn('no flusher set, dropping entries', { count: entries.length });
       this.alarmManager?.record(
@@ -287,17 +322,31 @@ export class InputManager extends EventEmitter {
         `dropped ${entries.length} entries from ${inputId}: no flusher`,
         { input_name: inputId },
       );
+      if (requireLocalDurableAck) {
+        throw new Error('Droid collection requires a durable OTLP batch sink');
+      }
       return;
     }
 
     const counter = this.counters.get(inputId);
     try {
-      await this.flusher.sendBatch(entries);
+      if (requireLocalDurableAck) {
+        const durableFlusher = this.flusher as BaseFlusher & {
+          sendBatchWithLocalDurableAck?: (batch: AgentActivityEntry[]) => Promise<void>;
+        };
+        if (typeof durableFlusher.sendBatchWithLocalDurableAck !== 'function') {
+          throw new Error('Droid collection requires a durable OTLP batch sink');
+        }
+        await durableFlusher.sendBatchWithLocalDurableAck(entries);
+      } else {
+        await this.flusher.sendBatch(entries);
+      }
       if (counter) counter.outEvents += entries.length;
       this.emit('flushed', { count: entries.length, bytes: batchBytes });
     } catch (err) {
       if (counter) counter.outFailed += entries.length;
       logger.error('dispatch failed', { count: entries.length, error: String(err) });
+      if (requireLocalDurableAck) throw err;
     }
   }
 }

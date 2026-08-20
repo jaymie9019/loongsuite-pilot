@@ -1,5 +1,5 @@
 import { InputState } from '../types/index.js';
-import { readJsonFile, writeJsonFile } from '../utils/fs-utils.js';
+import { ensurePrivateFile, readJsonFile, writeJsonFile } from '../utils/fs-utils.js';
 
 /** Serializable representation of the in-memory map. */
 type StateFileShape = Record<string, InputState>;
@@ -25,6 +25,7 @@ export class StateStore {
 
   async load(): Promise<void> {
     const data = await readJsonFile<StateFileShape | null>(this.filePath);
+    await ensurePrivateFile(this.filePath);
     this.states.clear();
     if (!data || typeof data !== 'object' || data === null) {
       this.dirty = false;
@@ -47,6 +48,7 @@ export class StateStore {
       out[k] = cloneState(v);
     }
     await writeJsonFile(this.filePath, out);
+    await ensurePrivateFile(this.filePath);
     this.dirty = false;
   }
 

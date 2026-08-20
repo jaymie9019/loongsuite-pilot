@@ -13,6 +13,9 @@ class TestInput extends BaseInput {
   collectFn: () => Promise<AgentActivityEntry[]> = async () => [];
   onStartFn: () => Promise<void> = async () => {};
   onStopFn: () => Promise<void> = async () => {};
+  beforeCheckpointFn: () => Promise<void> = async () => {};
+  afterCheckpointFn: () => Promise<void> = async () => {};
+  onCycleFailedFn: () => Promise<void> = async () => {};
 
   protected async collect(): Promise<AgentActivityEntry[]> {
     return this.collectFn();
@@ -24,6 +27,22 @@ class TestInput extends BaseInput {
 
   protected override async onStop(): Promise<void> {
     return this.onStopFn();
+  }
+
+  protected override async beforeCheckpoint(): Promise<void> {
+    return this.beforeCheckpointFn();
+  }
+
+  protected override async afterCheckpoint(): Promise<void> {
+    return this.afterCheckpointFn();
+  }
+
+  protected override async onCycleFailed(): Promise<void> {
+    return this.onCycleFailedFn();
+  }
+
+  requestCollectionNow(): void {
+    this.requestCollection();
   }
 }
 
@@ -138,6 +157,57 @@ describe('BaseInput', () => {
       await Promise.resolve();
     });
 
+    it('runs one coalesced follow-up when watcher requests arrive during a cycle', async () => {
+      await input.start();
+
+      let release!: () => void;
+      const firstCycle = new Promise<void>(resolve => { release = resolve; });
+      let cycleNumber = 0;
+      const collectFn = vi.fn(async () => {
+        cycleNumber++;
+        if (cycleNumber === 1) await firstCycle;
+        return [];
+      });
+      input.collectFn = collectFn;
+
+      input.requestCollectionNow();
+      await Promise.resolve();
+      input.requestCollectionNow();
+      input.requestCollectionNow();
+      input.requestCollectionNow();
+
+      expect(collectFn).toHaveBeenCalledTimes(1);
+      release();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(collectFn).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not start a requested follow-up after stop begins', async () => {
+      await input.start();
+
+      let release!: () => void;
+      const activeCycle = new Promise<void>(resolve => { release = resolve; });
+      let cycleNumber = 0;
+      const collectFn = vi.fn(async () => {
+        cycleNumber++;
+        if (cycleNumber === 1) await activeCycle;
+        return [];
+      });
+      input.collectFn = collectFn;
+
+      input.requestCollectionNow();
+      await Promise.resolve();
+      input.requestCollectionNow();
+      const stopping = input.stop();
+
+      release();
+      await stopping;
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(collectFn).toHaveBeenCalledTimes(1);
+    });
+
     it('waits for an active collection before completing stop', async () => {
       await input.start();
 
@@ -197,6 +267,50 @@ describe('BaseInput', () => {
 
       await vi.advanceTimersByTimeAsync(5_000);
       expect(stateStore.saveCount).toBe(2);
+    });
+
+    it('waits for the entry sink before committing a checkpoint', async () => {
+      input.collectFn = async () => [buildTestEntry()];
+      let release!: () => void;
+      const accepted = new Promise<void>(resolve => { release = resolve; });
+      const sink = vi.fn(() => accepted);
+      const beforeCheckpoint = vi.fn();
+      input.setEntrySink(sink);
+      input.beforeCheckpointFn = async () => { beforeCheckpoint(); };
+
+      const starting = input.start();
+      for (let attempt = 0; attempt < 10 && sink.mock.calls.length === 0; attempt++) {
+        await Promise.resolve();
+      }
+      const sinkCallsBeforeAck = sink.mock.calls.length;
+      const beforeCallsBeforeAck = beforeCheckpoint.mock.calls.length;
+      const savesBeforeAck = stateStore.saveCount;
+
+      release();
+      await starting;
+      expect(sinkCallsBeforeAck).toBe(1);
+      expect(beforeCallsBeforeAck).toBe(0);
+      expect(savesBeforeAck).toBe(0);
+      expect(beforeCheckpoint).toHaveBeenCalledOnce();
+      expect(stateStore.saveCount).toBe(1);
+    });
+
+    it('discards staged state and does not save when the entry sink rejects', async () => {
+      input.collectFn = async () => [buildTestEntry()];
+      input.setEntrySink(async () => { throw new Error('local durable queue full'); });
+      const beforeCheckpoint = vi.fn();
+      const afterCheckpoint = vi.fn();
+      const failed = vi.fn();
+      input.beforeCheckpointFn = async () => { beforeCheckpoint(); };
+      input.afterCheckpointFn = async () => { afterCheckpoint(); };
+      input.onCycleFailedFn = async () => { failed(); };
+
+      await input.start();
+
+      expect(beforeCheckpoint).not.toHaveBeenCalled();
+      expect(afterCheckpoint).not.toHaveBeenCalled();
+      expect(failed).toHaveBeenCalledOnce();
+      expect(stateStore.saveCount).toBe(0);
     });
   });
 

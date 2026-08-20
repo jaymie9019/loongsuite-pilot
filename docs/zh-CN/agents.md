@@ -16,6 +16,7 @@
 | Cursor | `cursor` | Hook 集成。 |
 | Cursor CLI | `cursor-cli` | 独立检测并输出为 `cursor-cli`，但复用 Cursor 已安装的 Hook/Input 链路，不会独立部署另一套 Hook；输出内容策略使用 `cursor-cli`。 |
 | DeepSeek Harness | `dsh` | 用户级 YAML patch 插件与本地 per-session JSONL 轮询；采集原生 LLM、reasoning、工具、Token 和 TTFT 数据。 |
+| Factory Droid | `droid` | 结构化 Hook 唤醒，并采集本地 transcript、settings 和通过版本校验的日志；输出记录使用 `gen_ai.agent.type=droid`。 |
 | Hermes Agent | `hermes-agent` | 原生目录插件和本地 session 文件采集；输出记录使用 `gen_ai.agent.type=hermes`。 |
 | Kiro CLI | `kiro-cli` | Hook 集成，并延迟采集本地 SQLite/session 数据；源端暂不提供 Token 用量。 |
 | MiMo Code | `mimo-code` | 插件注入，采集 LLM、工具和 Token 生命周期事件。 |
@@ -65,6 +66,77 @@ Pilot 使用原生请求边界到首个 reasoning、text 或 tool-call stream de
 会修复该 block。卸载会在删除插件资产之前执行相同的属主清理，并保留
 无关 YAML 内容。如果源事件缺少请求边界或输出 delta，Pilot 会省略 TTFT，
 不会伪造为 0。
+
+## Factory Droid 采集与回放
+
+Pilot 当前支持的 Droid 契约是 transcript schema v2。live 采集和历史回放
+遇到其他 transcript 版本时都会 fail closed；精确日志补充只接受 Droid
+`0.199.0` 和 `0.200.0`。这样上游本地格式变化时，不会被静默当成已验证的
+schema 解析。
+
+三个本地数据源承担不同职责，信任边界如下：
+
+1. transcript 是 session、turn、LLM、工具调用和可见消息结构的事实源；
+   `user_only` 与 `llm_only` 记录不会作为对话内容输出。
+2. 同名 session settings 文件用于补充 model/provider，并在无法精确匹配
+   单次调用时提供聚合 token 用量兜底。
+3. 保留下来的 Droid `0.199.0` 或 `0.200.0` 日志可为唯一匹配的调用补充精确的
+   单次 token、request/response 时间、TTFT 和 response ID；匹配有歧义时
+   Pilot 不猜测。
+
+因此，日志已被轮转或删除时仍可回放旧 transcript，但只有匹配日志仍在时，
+才能保证历史单次调用 token 精确。根据 settings baseline 是否存在，Pilot 会
+明确标记 `single_call_delta`、`turn_aggregate`、`session_aggregate` 或
+`missing`，不会把聚合值随意归到某一次调用。
+
+Droid Hook 只写结构化唤醒信息，Prompt、工具参数和工具结果仍从源文件读取。
+部署时追加 Pilot 条目，卸载时只删除这些条目，用户已有 Hook 会被保留；Hook
+延迟或缺失时仍由轮询兜底。该接入也不依赖 Droid 原生 OTLP 输出，而是由
+Pilot 根据上述本地源构建 AgentLoop 的 session/turn/step/LLM/tool 拓扑。
+
+如果关闭 Droid 内容采集，Pilot 会移除 Prompt、Completion、工具参数和工具
+结果字段；如果开启，这些内容仍固定经过完整的 Pilot `mode=all` 密钥与 PII
+脱敏规则，即使全局 masking 配置为 `none` 也不会绕过。
+
+先以只读方式检查完整历史 turn：
+
+```bash
+loongsuite-pilot droid replay --session-id <ID> --dry-run
+loongsuite-pilot droid replay --from <ISO_TIME> --to <ISO_TIME> --dry-run
+```
+
+dry-run 会跳过未结束 turn 和不支持的 transcript，应用相同内容策略及强制
+`mode=all` 脱敏，也不会打印 prompt 或 tool 内容。它还会读取
+`logs/input-state.json` 生成 strict eligibility 摘要：live 已处理的 transcript
+会按整份文件保守排除并计入 `liveProcessedSkipped`；缺失、不完整、pending 或
+已变化的 baseline receipt 会计入 `unsafeStateSkipped` 与
+`safetySkipReasons`。
+
+`droid replay --execute` 暂时禁用，并会在访问 source、queue 或 ledger 前直接
+返回 exit 1。AgentLoop 不会对拥有相同 trace/span ID 的 live span 与 replay span
+去重；此外，queue 先远端成功而 ledger 随后写入失败，仍可能再次入队同一份历史
+数据。安全启用需要 shared live/replay outbox/receipt，把 source ownership、
+durable enqueue 与 replay acknowledgement 进行原子协调。本版本不提供 force
+override。
+
+durable queue 在本地接收后提供原子文件写入、fsync、确定性 at-least-once
+去重、重启恢复和失败重试。网络错误及 408/429/5xx 保留在 pending，HTTP 400
+进入 dead-letter，401/403 会暂停对应 route。这项保证从数据进入
+`spool/otlp/v1` 后开始。Droid live 采集只有在所有已配置 durable route 都完成
+本地持久化接收后，才提交 source checkpoint 并删除 hook event；本地写入失败时
+transcript offset 和 hook 都保持可重试，且重试继续使用相同的确定性 ID。这一
+source-to-spool 确认只覆盖 Droid，尚未采用同一契约的既有 input 仍可能保留更早
+的 crash window。
+
+以下命令分别用于只读盘点 queue，以及显式触发一次立即发送：
+
+```bash
+loongsuite-pilot failed replay --dry-run
+loongsuite-pilot failed replay --execute
+```
+
+该命令会盘点旧 `logs/otlp-failed` JSONL，但不会自动回放；旧格式缺失
+scope、events 和 links，无法做无损迁移。
 
 ## OpenClaw 兼容性与生命周期
 
@@ -144,6 +216,7 @@ loongsuite-pilot restart
     "claude-code": { "enabled": true, "captureMessageContent": false },
     "codex": { "enabled": true, "captureMessageContent": false },
     "dsh": { "enabled": true, "captureMessageContent": false },
+    "droid": { "enabled": true, "captureMessageContent": false },
     "openclaw": { "enabled": true, "captureMessageContent": false },
     "cursor": { "enabled": true, "captureMessageContent": true }
   }
@@ -158,6 +231,8 @@ loongsuite-pilot restart
 | `skillTelemetry` | OMP 的 exact Skill activation 采集策略，默认关闭。详见 [Pi Coding Agent / OMP Skill telemetry](pi-coding-agent-skill-telemetry.md)。 |
 
 敏感环境建议同时设置 `captureMessageContent: false` 和 [数据脱敏](masking.md)。需要提取多模态数据时，见 [多模态采集](multimodal.md)（当前仅图像、仅 `codex` 生效）。
+敏感环境建议同时设置 `captureMessageContent: false` 和 [数据脱敏](masking.md)。
+Droid 即使开启内容采集，也固定应用完整的 `mode=all` 脱敏规则。
 
 ## 验证 Agent 采集
 

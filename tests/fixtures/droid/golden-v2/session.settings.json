@@ -1,0 +1,20 @@
+{
+  "assistantActiveTimeMs": 7594,
+  "model": "claude-opus-4-7",
+  "reasoningEffort": "high",
+  "interactionMode": "auto",
+  "tokenUsage": {
+    "inputTokens": 7,
+    "outputTokens": 203,
+    "cacheCreationTokens": 214,
+    "cacheReadTokens": 40380,
+    "thinkingTokens": 0
+  },
+  "providerLock": "anthropic",
+  "apiProviderLock": "bedrock_anthropic",
+  "lastCallTokenUsage": {
+    "inputTokens": 1,
+    "outputTokens": 41,
+    "cacheReadTokens": 20190
+  }
+}

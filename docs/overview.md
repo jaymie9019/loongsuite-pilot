@@ -26,6 +26,7 @@ LoongSuite Pilot runs on a developer machine and collects telemetry from support
 | Codex | Hook | Yes | Yes | Yes | Yes |
 | Cursor | Hook | Yes | Yes | Yes | Yes |
 | Cursor CLI | Shared Cursor hook | Yes | Yes | Yes | Yes |
+| Factory Droid | Hook wakeup + local transcript/settings/log polling | Yes | Yes | Conditional | Yes |
 | Hermes Agent | Native directory plugin | Yes | Yes | Yes | Yes |
 | Kiro CLI | Hook / local session polling | Yes | Yes | No | Yes |
 | MiMo Code | Plugin injection | Yes | Yes | Yes | Yes |
@@ -60,6 +61,29 @@ The general support table describes integration capabilities across Pilot and mu
 
 Agents omitted from this table do not currently have an explicit Windows support statement; omission does not necessarily mean that the agent cannot run on Windows. This matrix follows the [Alibaba Cloud AI Coding Agent access guide](https://help.aliyun.com/zh/cms/cloudmonitor-2-0/ai-application-access-ai-coding-agent/). See [Installation](installation.md) for Windows prerequisites and setup.
 
+### Factory Droid Data Path
+
+Factory Droid support is gated to transcript schema v2, with exact local-log
+enrichment explicitly gated to Droid `0.199.0` and `0.200.0`. Pilot treats the
+transcript as the session/turn/tool source of truth, settings as aggregate
+usage fallback, and a uniquely matched retained log record as optional
+per-call token and timing enrichment. Hooks carry structural wakeup hints only
+and coexist with user Hooks; polling remains the fallback. Droid's native OTLP
+export is not the primary source for this integration.
+
+Droid content always passes the complete `mode=all` masking plan before output.
+Historical complete turns can be inspected with
+`loongsuite-pilot droid replay <selector> --dry-run`. Exact historical per-call
+tokens require the corresponding Droid logs to remain available. See
+[Agent Configuration](agents.md#factory-droid-collection-and-replay) for the
+source trust order and replay rules.
+
+Because AgentLoop does not deduplicate matching trace/span IDs and the current
+path lacks a shared live/replay outbox/receipt, `droid replay --execute` is
+temporarily disabled and exits 1 before source or queue access. Dry-run remains
+available with `liveProcessedSkipped`, `unsafeStateSkipped`, and detailed
+eligibility reasons.
+
 ## Data Collected
 
 Pilot focuses on activity that is useful for usage analysis, audit, and traceability:
@@ -88,6 +112,16 @@ Pilot can fan out the same normalized event stream to multiple destinations:
 
 If no remote backend is configured, JSONL remains enabled by default so collected data is still visible locally.
 
+OTLP routes use a local durable spool. Once a batch has been atomically written
+and fsynced below `spool/otlp/v1`, retryable delivery failures survive process
+restart and are retried at least once. That acknowledgment is local, not an
+AgentLoop HTTP 2xx. Droid live collection waits for that local durable
+acknowledgment before committing its transcript checkpoint or deleting hook
+events, so a queue capacity or disk-write failure leaves the source eligible
+for retry with the same deterministic IDs. Existing inputs that have not
+adopted this acknowledgment contract may still have an earlier
+source-to-spool crash window.
+
 ## Local Runtime
 
 Default local data directory:
@@ -108,6 +142,7 @@ Important files and directories:
 | `logs/output/` | Local normalized JSONL output. |
 | `logs/input-state.json` | Input offsets and checkpoints. |
 | `logs/sls-failed-logs/` | Bounded SLS failure metadata for diagnosis; no failed payloads. |
+| `spool/otlp/v1/` | Durable per-route OTLP pending and dead-letter items. |
 | `versions/` and `current` | Versioned runtime layout used for updates and rollback. |
 
 ## Where To Go Next

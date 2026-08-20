@@ -1,5 +1,5 @@
 import { createLogger, type BoundLogger } from '../utils/logger.js';
-import { readJsonFile, writeJsonFile } from '../utils/fs-utils.js';
+import { ensurePrivateFile, readJsonFile, writeJsonFile } from '../utils/fs-utils.js';
 
 export interface SnapshotEntry {
   key: string;
@@ -44,6 +44,7 @@ export class SnapshotStore {
 
   async load(): Promise<void> {
     const data = await readJsonFile<SnapshotStoreData | null>(this.filePath);
+    await ensurePrivateFile(this.filePath);
     this.entries.clear();
     if (!data || !Array.isArray(data.entries)) {
       this.highWatermark = 0;
@@ -81,6 +82,7 @@ export class SnapshotStore {
       entries: Array.from(this.entries.values()),
     };
     await writeJsonFile(this.filePath, payload);
+    await ensurePrivateFile(this.filePath);
     this.dirty = false;
   }
 

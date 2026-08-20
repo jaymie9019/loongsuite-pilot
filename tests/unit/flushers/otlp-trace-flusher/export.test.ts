@@ -1,4 +1,7 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { ExportResultCode } from '@opentelemetry/core';
 import * as fsUtils from '../../../../src/utils/fs-utils.js';
 
@@ -22,6 +25,8 @@ vi.mock('@opentelemetry/exporter-trace-otlp-proto', () => ({
 
 vi.spyOn(fsUtils, 'appendLine').mockResolvedValue(undefined);
 vi.spyOn(fsUtils, 'ensureDir').mockResolvedValue(undefined);
+vi.spyOn(fsUtils, 'ensurePrivateDir').mockResolvedValue(undefined);
+vi.spyOn(fsUtils, 'ensurePrivateFile').mockResolvedValue(undefined);
 
 import { OtlpTraceFlusher } from '../../../../src/flushers/otlp-trace-flusher.js';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
@@ -55,6 +60,8 @@ describe('OtlpTraceFlusher - export', () => {
     mockExport.mockClear();
     vi.mocked(fsUtils.appendLine).mockClear();
     vi.mocked(fsUtils.ensureDir).mockClear();
+    vi.mocked(fsUtils.ensurePrivateDir).mockClear();
+    vi.mocked(fsUtils.ensurePrivateFile).mockClear();
   });
 
   it('calls exporter.export via exportSpansForAgent test seam', async () => {
@@ -74,7 +81,7 @@ describe('OtlpTraceFlusher - export', () => {
     await flusher.exportSpansForAgent('claude-code', spans);
     await flusher.shutdown();
 
-    expect(fsUtils.ensureDir).toHaveBeenCalled();
+    expect(fsUtils.ensurePrivateDir).toHaveBeenCalled();
     expect(fsUtils.appendLine).toHaveBeenCalled();
     const writtenPath = vi.mocked(fsUtils.appendLine).mock.calls[0][0];
     expect(writtenPath).toContain('otlp-debug');
@@ -112,6 +119,37 @@ describe('OtlpTraceFlusher - export', () => {
     const written = JSON.parse(failedCalls[0][1] as string);
     expect(written._error).toBeDefined();
     expect(written._error.message).toContain('401');
+  });
+
+  it('does not fall back to the unbounded legacy failed log when durable local enqueue fails', async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'pilot-durable-live-failure-'));
+    await fs.writeFile(path.join(dataDir, 'spool'), 'blocks durable queue initialization');
+    const flusher = new OtlpTraceFlusher(makeConfig({ dataDir }));
+    const span = {
+      ...makeMockSpan(),
+      duration: [1, 0],
+      links: [],
+      events: [],
+      ended: true,
+      instrumentationLibrary: { name: 'test' },
+      droppedAttributesCount: 0,
+      droppedEventsCount: 0,
+      droppedLinksCount: 0,
+    };
+
+    try {
+      await expect(flusher.exportSpansForAgent('claude-code', [span] as any))
+        .resolves.toBeUndefined();
+      await new Promise(resolve => setImmediate(resolve));
+
+      const failedCalls = vi.mocked(fsUtils.appendLine).mock.calls.filter(
+        (call) => (call[0] as string).includes('otlp-failed'),
+      );
+      expect(failedCalls).toHaveLength(0);
+    } finally {
+      await flusher.shutdown();
+      await fs.rm(dataDir, { recursive: true, force: true });
+    }
   });
 
   it('exports small total size in a single call', async () => {

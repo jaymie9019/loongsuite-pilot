@@ -405,6 +405,49 @@ describe('HookManager', () => {
     await expect(fs.readFile(settingsPath, 'utf-8')).resolves.toBe(invalid);
   });
 
+  it('fails closed without changing incompatible strict-JSON hook paths', async () => {
+    const settingsPath = path.join(tmpDir, '.factory', 'settings.json');
+    await fs.mkdir(path.dirname(settingsPath), { recursive: true });
+    const original = '{\n  "model": "user-model",\n  "hooks": "owned-by-user"\n}\n';
+    await fs.writeFile(settingsPath, original, { encoding: 'utf8', mode: 0o600 });
+    const manager = new HookManager(path.join(tmpDir, 'hooks'), path.join(tmpDir, 'logs'));
+    const definition = {
+      agentId: 'droid',
+      settingsPath,
+      hookJsonPath: ['hooks', 'Stop'],
+      hookCommand: '/opt/droid-loongsuite-pilot-hook.sh stop',
+      matcher: '*',
+      useNestedFormat: true,
+    };
+
+    await expect(manager.installHook(definition)).resolves.toBe(false);
+    await expect(fs.readFile(settingsPath, 'utf8')).resolves.toBe(original);
+    await expect(manager.uninstallHook(definition)).resolves.toBe(false);
+    await expect(fs.readFile(settingsPath, 'utf8')).resolves.toBe(original);
+  });
+
+  it('keeps strict-JSON settings private across atomic install and uninstall', async () => {
+    const settingsPath = path.join(tmpDir, '.factory', 'settings.json');
+    const manager = new HookManager(path.join(tmpDir, 'hooks'), path.join(tmpDir, 'logs'));
+    const definition = {
+      agentId: 'droid',
+      settingsPath,
+      hookJsonPath: ['hooks', 'Stop'],
+      hookCommand: '/opt/droid-loongsuite-pilot-hook.sh stop',
+      matcher: '*',
+      useNestedFormat: true,
+    };
+
+    await expect(manager.installHook(definition)).resolves.toBe(true);
+    if (process.platform !== 'win32') {
+      expect((await fs.stat(settingsPath)).mode & 0o777).toBe(0o600);
+    }
+    await expect(manager.uninstallHook(definition)).resolves.toBe(true);
+    if (process.platform !== 'win32') {
+      expect((await fs.stat(settingsPath)).mode & 0o777).toBe(0o600);
+    }
+  });
+
   describe('winShell upgrade (nested `shell` field)', () => {
     const HOOK_CMD = 'powershell -NoProfile -ExecutionPolicy Bypass -File "C:\\qoder-loongsuite-pilot-hook.ps1" qoder';
 

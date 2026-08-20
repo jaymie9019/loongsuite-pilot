@@ -5,6 +5,7 @@ const mockReadJsonFile = vi.fn().mockResolvedValue(null);
 vi.mock('../../../src/utils/fs-utils.js', () => ({
   readJsonFile: (...args: unknown[]) => mockReadJsonFile(...args),
   resolveHome: (p: string) => p.replace(/^~/, '/home/test'),
+  ensurePrivateFile: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock('../../../src/utils/logger.js', () => ({

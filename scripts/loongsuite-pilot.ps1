@@ -1119,9 +1119,32 @@ function Cmd-Info {
 
     Write-Host ""
     if (Test-Path $CONFIG_FILE) {
-        # -Encoding UTF8: node writes config.json as UTF-8 with no BOM, and 5.1's
-        # BOM sniffing then falls back to ANSI, printing a Chinese prefix as mojibake.
-        Get-Content $CONFIG_FILE -Encoding UTF8
+        $nodeBin = Resolve-Node
+        if ($nodeBin) {
+            $redactJs = @'
+const fs = require("fs");
+const file = process.argv[1];
+const sensitive = /^(licenseKey|accessKeySecret|apiKey|authorization|headers?|password|token)$/i;
+function redact(value) {
+  if (Array.isArray(value)) return value.map(redact);
+  if (!value || typeof value !== "object") return value;
+  const out = {};
+  for (const [key, child] of Object.entries(value)) {
+    out[key] = sensitive.test(key) ? "[REDACTED]" : redact(child);
+  }
+  return out;
+}
+try {
+  const config = JSON.parse(fs.readFileSync(file, "utf8").replace(/^\uFEFF/, ""));
+  process.stdout.write(JSON.stringify(redact(config), null, 2) + "\n");
+} catch {
+  process.stdout.write("(config exists but could not be parsed)\n");
+}
+'@
+            & $nodeBin -e $redactJs $CONFIG_FILE
+        } else {
+            Write-Host "(config redacted: node runtime unavailable)"
+        }
     }
 }
 
@@ -1371,6 +1394,62 @@ function Cmd-Agent {
 }
 
 # ============================================================
+# CMD: droid (Factory Droid transcript replay CLI)
+# ============================================================
+function Cmd-Droid {
+    $versionDir = Resolve-CurrentVersion
+    if (-not $versionDir) {
+        Write-Error "Current loongsuite-pilot version not found"
+        exit 1
+    }
+
+    $entry = Join-Path $versionDir "dist\index.js"
+    if (-not (Test-Path $entry -PathType Leaf)) {
+        Write-Error "Droid CLI entrypoint missing"
+        exit 1
+    }
+
+    $nodeBin = Resolve-Node
+    if (-not $nodeBin) {
+        Write-Error "node runtime not found"
+        exit 1
+    }
+
+    $env:AGENT_DATA_COLLECTION_CONFIG = $CONFIG_FILE
+    $env:LOONGSUITE_PILOT_DATA_DIR = $DATA_DIR
+    & $nodeBin $entry "droid" @SubArgs
+    exit $LASTEXITCODE
+}
+
+# ============================================================
+# CMD: failed (durable OTLP queue inventory/replay CLI)
+# ============================================================
+function Cmd-Failed {
+    $versionDir = Resolve-CurrentVersion
+    if (-not $versionDir) {
+        Write-Error "Current loongsuite-pilot version not found"
+        exit 1
+    }
+
+    $entry = Join-Path $versionDir "dist\index.js"
+    if (-not (Test-Path $entry -PathType Leaf)) {
+        Write-Error "Failed-queue CLI entrypoint missing"
+        exit 1
+    }
+
+    $nodeBin = Resolve-Node
+    if (-not $nodeBin) {
+        Write-Error "node runtime not found"
+        exit 1
+    }
+
+    $env:AGENT_DATA_COLLECTION_CONFIG = $CONFIG_FILE
+    $env:LOONGSUITE_PILOT_DATA_DIR = $DATA_DIR
+    & $nodeBin $entry "failed" @SubArgs
+    exit $LASTEXITCODE
+}
+
+# ============================================================
 # CMD: help
 # ============================================================
 # Manage span-attributes.json -- user-defined attributes injected into trace
@@ -1440,6 +1519,8 @@ function Cmd-Help {
     Write-Host "                    --json           machine-readable result"
     Write-Host "  token-usage     Show token usage TUI"
     Write-Host "  tokens          Alias for token-usage"
+    Write-Host "  droid replay    Inspect or explicitly enqueue Factory Droid history"
+    Write-Host "  failed replay   Inspect or explicitly retry the durable OTLP queue"
     Write-Host "  span-attr ...   Manage custom trace span attributes (set/unset/list/clear)"
     Write-Host "  agent ...       Register/list/diagnose PI SDK Agents"
     Write-Host "  rollback        Roll back to the previous version"
@@ -1464,6 +1545,8 @@ switch ($Command.ToLower()) {
     "rollback"           { Cmd-Rollback }
     "worker"             { Cmd-Worker }
     "agent"              { Cmd-Agent }
+    "droid"              { Cmd-Droid }
+    "failed"             { Cmd-Failed }
     "restart-collector"  { Cmd-RestartCollector }
     "restart-updater"    { Cmd-RestartUpdater }
     "run"                { Cmd-Run }

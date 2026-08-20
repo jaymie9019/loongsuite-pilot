@@ -1,6 +1,6 @@
 import * as path from 'node:path';
+import { stat } from 'node:fs/promises';
 import {
-  writeJsonFile,
   writeTextFileAtomic,
   ensureDir,
   resolveHome,
@@ -94,19 +94,24 @@ export class HookManager {
       const settings = document.status === 'missing' || document.status === 'empty'
         ? {}
         : this.requireSettingsObject(document.data);
+      const writeOptions = await this.strictJsonWriteOptions(def.settingsPath, document);
 
       let target: any = settings;
       for (let i = 0; i < def.hookJsonPath.length - 1; i++) {
         const key = def.hookJsonPath[i];
-        if (!target[key] || typeof target[key] !== 'object') {
+        if (target[key] === undefined) {
           target[key] = {};
+        } else if (!target[key] || typeof target[key] !== 'object' || Array.isArray(target[key])) {
+          throw new Error(`hook path is not an object: ${def.hookJsonPath.slice(0, i + 1).join('.')}`);
         }
         target = target[key];
       }
 
       const lastKey = def.hookJsonPath[def.hookJsonPath.length - 1];
-      if (!Array.isArray(target[lastKey])) {
+      if (target[lastKey] === undefined) {
         target[lastKey] = [];
+      } else if (!Array.isArray(target[lastKey])) {
+        throw new Error(`hook path is not an array: ${def.hookJsonPath.join('.')}`);
       }
 
       const arr = target[lastKey] as any[];
@@ -123,7 +128,7 @@ export class HookManager {
         // repair the stale entry in place instead of leaving it untouched.
         const shellRepaired = this.applyShellToEntries(updatedArr, def.hookCommand, def.shell);
         if (updatedArr !== arr || shellRepaired) {
-          await writeJsonFile(def.settingsPath, settings);
+          await this.writeStrictJson(def.settingsPath, settings, writeOptions);
         }
         logger.debug('hook already installed', { agentId: def.agentId });
         return true;
@@ -145,7 +150,7 @@ export class HookManager {
           };
 
       updatedArr.push(hookEntry);
-      await writeJsonFile(def.settingsPath, settings);
+      await this.writeStrictJson(def.settingsPath, settings, writeOptions);
 
       // Ensure log directory for this agent
       await ensureDir(def.historyDir ?? path.join(this.logBaseDir, def.agentId, 'history'));
@@ -179,16 +184,23 @@ export class HookManager {
         throw new Error(`refusing to overwrite invalid settings: ${document.error.message}`);
       }
       const settings = this.requireSettingsObject(document.data);
+      const writeOptions = await this.strictJsonWriteOptions(def.settingsPath, document);
 
       let target: any = settings;
       for (let i = 0; i < def.hookJsonPath.length - 1; i++) {
         const key = def.hookJsonPath[i];
-        if (!target[key]) return true;
+        if (target[key] === undefined) return true;
+        if (!target[key] || typeof target[key] !== 'object' || Array.isArray(target[key])) {
+          throw new Error(`hook path is not an object: ${def.hookJsonPath.slice(0, i + 1).join('.')}`);
+        }
         target = target[key];
       }
 
       const lastKey = def.hookJsonPath[def.hookJsonPath.length - 1];
-      if (!Array.isArray(target[lastKey])) return true;
+      if (target[lastKey] === undefined) return true;
+      if (!Array.isArray(target[lastKey])) {
+        throw new Error(`hook path is not an array: ${def.hookJsonPath.join('.')}`);
+      }
 
       const commands = [def.hookCommand, ...(def.replaceHookCommands ?? [])];
       target[lastKey] = this.removeCommands(target[lastKey] as any[], commands);
@@ -196,7 +208,7 @@ export class HookManager {
         delete target[lastKey];
       }
 
-      await writeJsonFile(def.settingsPath, settings);
+      await this.writeStrictJson(def.settingsPath, settings, writeOptions);
       logger.info('hook uninstalled', { agentId: def.agentId });
       return true;
     } catch (err) {
@@ -412,6 +424,41 @@ export class HookManager {
       throw new Error('settings root must be a JSON object');
     }
     return value as Record<string, unknown>;
+  }
+
+  private async strictJsonWriteOptions(
+    settingsPath: string,
+    document: { status: 'missing' } | { status: 'empty' | 'ok'; raw: string },
+  ): Promise<{
+    expected: { exists: false } | { exists: true; content: string };
+    backupPath?: string;
+    mode: number;
+  }> {
+    if (document.status === 'missing') {
+      return { expected: { exists: false }, mode: 0o600 };
+    }
+    const mode = (await stat(settingsPath)).mode & 0o777;
+    return {
+      expected: { exists: true, content: document.raw },
+      backupPath: `${settingsPath}.loongsuite-pilot.bak`,
+      mode,
+    };
+  }
+
+  private async writeStrictJson(
+    settingsPath: string,
+    settings: Record<string, unknown>,
+    options: {
+      expected: { exists: false } | { exists: true; content: string };
+      backupPath?: string;
+      mode: number;
+    },
+  ): Promise<void> {
+    await writeTextFileAtomic(
+      settingsPath,
+      `${JSON.stringify(settings, null, 2)}\n`,
+      options,
+    );
   }
 
   /**

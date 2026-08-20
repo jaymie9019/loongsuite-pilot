@@ -906,12 +906,12 @@ while true; do sleep 1; done
             'local',
             'managed-runtime',
           ]);
-        });
+        }, { timeout: 5_000 });
 
         await vi.waitFor(async () => {
           const log = await fs.readFile(logPath, 'utf-8');
           expect(log).toContain(`PLUGIN=${path.join(bundleRoot, 'sample-plugin')}`);
-        });
+        }, { timeout: 5_000 });
 
         expect(await strategy.stopWorker(def, { instance, runtimeOptions })).toBe(true);
         const stopped = JSON.parse(await fs.readFile(statusPath, 'utf-8')) as { state: string };

@@ -1030,7 +1030,8 @@ if (opts.selectedAgents) {
   }
 }
 
-fs.writeFileSync(opts.configPath, JSON.stringify(config, null, 2) + '\n');
+fs.writeFileSync(opts.configPath, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+fs.chmodSync(opts.configPath, 0o600);
 '@ $cfgTmp
     $ErrorActionPreference = $prevEAP
     Remove-Item -LiteralPath $cfgTmp -Force -ErrorAction SilentlyContinue
@@ -1283,6 +1284,7 @@ function GC-OldVersions {
 # ============================================================
 function Remove-HookConfigs {
     $HOOK_MARKER = ".loongsuite-pilot"
+    $managedHooksDir = Join-Path $DataDir "hooks"
     $configs = @(
         (Join-Path $env:USERPROFILE ".cursor\hooks.json"),
         (Join-Path $env:USERPROFILE ".qoder\settings.json"),
@@ -1293,7 +1295,8 @@ function Remove-HookConfigs {
         (Join-Path $env:USERPROFILE ".claude\settings.json"),
         (Join-Path $env:USERPROFILE ".kiro\agents\pilot-kiro.json"),
         (Join-Path $env:USERPROFILE ".qwen\settings.json"),
-        (Join-Path $env:USERPROFILE ".workbuddy\settings.json")
+        (Join-Path $env:USERPROFILE ".workbuddy\settings.json"),
+        (Join-Path $env:USERPROFILE ".factory\settings.json")
     )
 
     foreach ($cfg in $configs) {
@@ -1304,22 +1307,38 @@ function Remove-HookConfigs {
             $prevEAP = $ErrorActionPreference; $ErrorActionPreference = "Continue"
             & $script:NODE_BIN -e @'
 const fs = require('fs');
-const cfg = process.argv[1];
-const marker = process.argv[2];
+const cfg = process.argv[process.argv.length - 2];
+const managedHooksDir = String(process.argv[process.argv.length - 1] || '').replace(/\\/g, '/').replace(/\/+$/, '');
+const escapeRegex = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const managedHookPattern = new RegExp(
+  '(?:^|[\\s"\'&])' + escapeRegex(managedHooksDir)
+    + '/[^/\\s"\']*loongsuite-pilot-hook\\.(?:sh|ps1)(?=["\'\\s]|$)',
+  'i',
+);
+const isManagedHookCommand = command => typeof command === 'string'
+  && managedHooksDir.length > 0
+  && managedHookPattern.test(command.replace(/\\/g, '/'));
 try {
+  const originalMode = fs.statSync(cfg).mode & 0o777;
   const data = JSON.parse(fs.readFileSync(cfg, 'utf-8'));
   const hooks = data.hooks;
   if (!hooks || typeof hooks !== 'object') process.exit(0);
   let changed = false;
   for (const [event, entries] of Object.entries(hooks)) {
     if (!Array.isArray(entries)) continue;
-    const filtered = entries.filter(e => {
-      const cmd = e.command || '';
-      const nested = Array.isArray(e.hooks) ? e.hooks : [];
-      const hasMarker = cmd.includes(marker) || nested.some(h => (h.command || '').includes(marker));
-      if (hasMarker) changed = true;
-      return !hasMarker;
-    });
+    const filtered = [];
+    for (const e of entries) {
+      if (!e || typeof e !== 'object') { filtered.push(e); continue; }
+      const cmd = typeof e.command === 'string' ? e.command : '';
+      if (isManagedHookCommand(cmd)) { changed = true; continue; }
+      if (!Array.isArray(e.hooks)) { filtered.push(e); continue; }
+      const nested = e.hooks.filter(h =>
+        !h || typeof h !== 'object' || !isManagedHookCommand(h.command));
+      if (nested.length === e.hooks.length) { filtered.push(e); continue; }
+      changed = true;
+      // Preserve user-owned sibling hooks and the surrounding matcher group.
+      if (nested.length > 0) filtered.push({ ...e, hooks: nested });
+    }
     if (filtered.length === 0) { delete hooks[event]; changed = true; }
     else hooks[event] = filtered;
   }
@@ -1329,10 +1348,13 @@ try {
   }
   if (changed) {
     fs.writeFileSync(cfg, JSON.stringify(data, null, 2) + '\n', 'utf-8');
+    fs.chmodSync(cfg, originalMode);
   }
 } catch(e) { process.stderr.write(e.message); process.exit(1); }
-'@ $cfg $HOOK_MARKER 2>$null
+'@ $cfg $managedHooksDir 2>$null
+            $nodeExit = $LASTEXITCODE
             $ErrorActionPreference = $prevEAP
+            if ($nodeExit -ne 0) { throw "hook cleanup helper failed with exit code $nodeExit" }
             Msg "    ✅ 已清理: $short" "    ✅ Cleaned: $short"
         } catch {
             Msg "    ⚠️  跳过: $short (需手动清理)" "    ⚠️  Skipped: $short (manual cleanup needed)"

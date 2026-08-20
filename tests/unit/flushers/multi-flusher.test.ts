@@ -45,6 +45,39 @@ describe('MultiFlusher', () => {
     });
   });
 
+  describe('local durable checkpoint acknowledgement', () => {
+    it('rejects when any durable participant rejects', async () => {
+      f1.shouldFail = true;
+      await expect(multi.sendBatchWithLocalDurableAck([buildTestEntry()]))
+        .rejects.toThrow('local durable batch acceptance failed');
+      expect(f2.batchCalls).toHaveLength(1);
+    });
+
+    it('does not let an auxiliary backend failure veto a durable ACK', async () => {
+      const auxiliary = {
+        name: 'auxiliary',
+        sendBatch: vi.fn(async () => { throw new Error('auxiliary unavailable'); }),
+      };
+      const mixed = new MultiFlusher([f1, auxiliary as any]);
+
+      await expect(mixed.sendBatchWithLocalDurableAck([buildTestEntry()]))
+        .resolves.toBeUndefined();
+      expect(f1.batchCalls).toHaveLength(1);
+      expect(auxiliary.sendBatch).toHaveBeenCalledOnce();
+    });
+
+    it('fails closed when no child provides durable acceptance', async () => {
+      const auxiliary = {
+        name: 'auxiliary',
+        sendBatch: vi.fn(async () => undefined),
+      };
+      const withoutDurableRoute = new MultiFlusher([auxiliary as any]);
+
+      await expect(withoutDurableRoute.sendBatchWithLocalDurableAck([buildTestEntry()]))
+        .rejects.toThrow('no flusher provides local durable batch acceptance');
+    });
+  });
+
   describe('send — single entry dispatch', () => {
     it('dispatches single entry to all flushers', async () => {
       const entry = buildTestEntry();

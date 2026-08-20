@@ -19,6 +19,7 @@ export const AGENT_SYSTEM_MAP: Record<string, string> = {
   'wukong': 'wukong',
   'workbuddy': 'workbuddy',
   'dsh': 'dsh',
+  'droid': 'factory',
 };
 
 export function resolveAgentSystem(agentType: string): string {

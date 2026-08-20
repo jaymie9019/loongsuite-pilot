@@ -43,6 +43,18 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === 'droid') {
+    const { runDroidCommand } = await import('./cli/droid-replay.js');
+    process.exitCode = await runDroidCommand(args);
+    return;
+  }
+
+  if (command === 'failed') {
+    const { runFailedCommand } = await import('./cli/failed-replay.js');
+    process.exitCode = await runFailedCommand(args);
+    return;
+  }
+
   const config = await loadConfig();
 
   const dataDir = resolveHome(config.dataDir);
@@ -194,6 +206,32 @@ export { CodexTranscriptInput } from './inputs/codex-transcript/codex-transcript
 export { CodexAbortedTurnInput } from './inputs/codex-aborted-turn/codex-aborted-turn-input.js';
 export { PiCodingAgentLogInput } from './inputs/pi-coding-agent-log/pi-coding-agent-log-input.js';
 export { WorkBuddyInput } from './inputs/workbuddy/workbuddy-input.js';
+export { DroidInput } from './inputs/droid/droid-input.js';
+export type { DroidInputOptions } from './inputs/droid/droid-input.js';
+export { buildDroidEvents } from './inputs/droid/droid-event-builder.js';
+export {
+  createDroidLogParser,
+  parseDroidLogLines,
+  readDroidSettings,
+  readDroidTranscript,
+} from './inputs/droid/droid-parser.js';
+export {
+  readDroidLogObservations,
+  selectDroidLogCandidateNames,
+} from './inputs/droid/droid-log-reader.js';
+export type {
+  DroidLogParser,
+  DroidLogParserOptions,
+} from './inputs/droid/droid-parser.js';
+export type {
+  DroidBuildOptions,
+  DroidBuildResult,
+  DroidHookEvent,
+  DroidLlmObservation,
+  DroidRecord,
+  DroidSessionSettings,
+  DroidUsage,
+} from './inputs/droid/droid-types.js';
 export { BaseFlusher } from './flushers/base-flusher.js';
 export { SlsFlusher } from './flushers/sls-flusher.js';
 export { JsonlFlusher } from './flushers/jsonl-flusher.js';

@@ -44,6 +44,7 @@ Pilot 主要帮助回答这些问题：
 | Cursor | Hook | Yes | Yes | Yes | Yes |
 | Cursor CLI | 复用 Cursor Hook | Yes | Yes | Yes | Yes |
 | DeepSeek Harness | YAML patch 插件 + 本地 JSONL 轮询 | Yes | Yes | Yes | Yes |
+| Factory Droid | Hook 唤醒 + 本地 transcript/settings/log 轮询 | Yes | Yes | Conditional | Yes |
 | Hermes Agent | 原生目录插件 | Yes | Yes | Yes | Yes |
 | Kiro CLI | Hook / session 轮询 | Yes | Yes | No | Yes |
 | MiMo Code | 插件注入 | Yes | Yes | Yes | Yes |
@@ -66,6 +67,27 @@ DeepSeek Harness（`dsh`）通过用户级 `cordis.patch.yml` 加载 Pilot
 可观测插件，采集原生 LLM、reasoning、工具、Token 和首 Token
 延迟数据。启用、原始日志、禁用和卸载行为见
 [《Agent 配置》](docs/zh-CN/agents.md#deepseek-harness-采集与生命周期)。
+
+Factory Droid 接入支持 transcript schema v2。transcript 是对话和工具活动的
+事实源，session settings 提供聚合用量兜底，只有显式通过版本校验的 Droid
+`0.199.0` 和 `0.200.0` 日志才用于补充精确的单次调用 token 和耗时。Hook
+只写结构化唤醒信号，安装和卸载都会保留用户已有 Hook。此接入不把 Droid
+原生 OTLP 输出作为主采集链路。
+
+Droid 内容在输出前固定经过 Pilot 完整的 `mode=all` 脱敏规则。历史 replay
+当前仅支持通过 `loongsuite-pilot droid replay --session-id <ID> --dry-run`
+检查；只有对应 Droid 日志仍在时，dry-run 才能展示精确的单次调用 token。
+
+AgentLoop 不会按相同 trace/span ID 对 replay span 去重，当前 replay 链路也没有
+shared live/replay outbox/receipt。因此，`droid replay --execute` 暂时禁用，
+会在读取 source 或 queue 前直接返回 exit 1。dry-run 仍保留 strict eligibility
+摘要：live 已处理的 transcript 计入 `liveProcessedSkipped`，缺失、不完整、
+pending 或已变化的 baseline receipt 计入 `unsafeStateSkipped`。信任与 replay
+边界见 [Agent 配置](docs/zh-CN/agents.md#factory-droid-采集与回放)。
+
+使用 `loongsuite-pilot failed replay --dry-run` 盘点 durable queue，使用
+`--execute` 显式触发一次发送。旧 `logs/otlp-failed` 文件因无法无损重建，
+只做盘点，不会自动回放。
 
 ### Windows Agent 明确支持情况
 

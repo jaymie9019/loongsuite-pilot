@@ -26,6 +26,7 @@ LoongSuite Pilot 运行在开发者本机，用于采集支持的 AI Coding Agen
 | Codex | Hook | Yes | Yes | Yes | Yes |
 | Cursor | Hook | Yes | Yes | Yes | Yes |
 | Cursor CLI | 复用 Cursor Hook | Yes | Yes | Yes | Yes |
+| Factory Droid | Hook 唤醒 + 本地 transcript/settings/log 轮询 | Yes | Yes | Conditional | Yes |
 | Hermes Agent | 原生目录插件 | Yes | Yes | Yes | Yes |
 | Kiro CLI | Hook / 本地 session 轮询 | Yes | Yes | No | Yes |
 | MiMo Code | 插件注入 | Yes | Yes | Yes | Yes |
@@ -60,6 +61,24 @@ OpenClaw 集成要求 OpenClaw 2026.5.12 或更高版本。
 
 未列入此表的 Agent，表示当前没有明确的 Windows 支持声明，并不一定代表无法在 Windows 上运行。该矩阵参考[阿里云 AI Coding Agent 接入文档](https://help.aliyun.com/zh/cms/cloudmonitor-2-0/ai-application-access-ai-coding-agent/)。Windows 环境要求与安装方法见[安装指南](installation.md)。
 
+### Factory Droid 数据链路
+
+Factory Droid 当前支持 transcript schema v2，精确本地日志补充只接受 Droid
+`0.199.0` 和 `0.200.0`。Pilot 将 transcript 作为 session、turn 和工具结构的
+事实源，将 settings 作为聚合用量兜底，仅在日志唯一匹配时补充单次调用 token
+与耗时。Hook 只携带结构化唤醒信息，并与用户 Hook 共存；轮询仍是兜底。
+Droid 原生 OTLP 输出不是此接入的主数据源。
+
+Droid 内容在输出前固定经过完整的 `mode=all` 脱敏规则。可用
+`loongsuite-pilot droid replay <selector> --dry-run` 检查历史完整 turn。只有
+对应 Droid 日志仍在时，历史单次调用 token 才能保证精确。数据源信任顺序和回放规则见
+[Agent 配置](agents.md#factory-droid-采集与回放)。
+
+由于 AgentLoop 不会按相同 trace/span ID 去重，当前链路也缺少 shared
+live/replay outbox/receipt，`droid replay --execute` 暂时禁用，并会在访问 source
+或 queue 前返回 exit 1。dry-run 仍可用，并报告 `liveProcessedSkipped`、
+`unsafeStateSkipped` 和详细 eligibility reason。
+
 ## 采集的数据
 
 Pilot 关注对使用分析、审计和链路追踪有价值的活动：
@@ -88,6 +107,13 @@ Pilot 可以将同一份规范化事件流输出到多个目标：
 
 如果没有配置远端后端，JSONL 默认保持开启，方便本地验证采集是否生效。
 
+OTLP route 使用本地 durable spool。batch 原子写入并 fsync 到
+`spool/otlp/v1` 后，可在进程重启后保留并按 at-least-once 语义重试可恢复错误；
+这个确认表示本地接收，不代表 AgentLoop HTTP 2xx。Droid live 采集会等待这次
+本地持久化确认，之后才提交 transcript checkpoint 并删除 hook event；queue
+容量不足或磁盘写入失败时，源数据会以相同的确定性 ID 保持可重试。尚未接入
+这一确认契约的既有 input 仍可能存在更早的 source-to-spool crash window。
+
 ## 本地运行目录
 
 默认数据目录：
@@ -108,6 +134,7 @@ Pilot 可以将同一份规范化事件流输出到多个目标：
 | `logs/output/` | 本地规范化 JSONL 输出。 |
 | `logs/input-state.json` | 输入源偏移和 checkpoint。 |
 | `logs/sls-failed-logs/` | 有容量上限的 SLS 失败诊断元数据，不包含失败 payload。 |
+| `spool/otlp/v1/` | 按 route 保存的 durable OTLP pending 与 dead-letter 数据。 |
 | `versions/` 和 `current` | 用于升级和回滚的版本目录与指针。 |
 
 ## 下一步

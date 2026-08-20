@@ -24,6 +24,7 @@ class StubInput extends EventEmitter {
   private _running = false;
   startCalls = 0;
   stopCalls = 0;
+  private entrySink: ((entries: AgentActivityEntry[]) => Promise<void>) | null = null;
 
   constructor(id: string) {
     super();
@@ -40,6 +41,15 @@ class StubInput extends EventEmitter {
   async stop() {
     this._running = false;
     this.stopCalls++;
+  }
+
+  setEntrySink(sink: (entries: AgentActivityEntry[]) => Promise<void>) {
+    this.entrySink = sink;
+  }
+
+  async deliver(entries: AgentActivityEntry[]) {
+    if (!this.entrySink) throw new Error('entry sink not installed');
+    await this.entrySink(entries);
   }
 }
 
@@ -166,6 +176,29 @@ describe('InputManager', () => {
       expect(dispatched['user.id']).toBe('customer-user');
       expect(dispatched).not.toHaveProperty(INVOCATION_SESSION_ID_FIELD);
       expect(dispatched).not.toHaveProperty(INVOCATION_USER_ID_FIELD);
+    });
+  });
+
+  describe('upstream trace linking', () => {
+    it('preserves deterministic Droid trace IDs while still linking other agents', async () => {
+      const input = new StubInput('mixed-link-test');
+      manager.registerInput(input as any);
+      const stamp = vi.fn(async (entries: AgentActivityEntry[]) => {
+        for (const entry of entries) entry.trace_id = 'f'.repeat(32);
+      });
+      manager.setTraceLinker({ stamp } as any);
+
+      const droid = buildTestEntry({ agentType: 'droid' as ClientType });
+      droid.trace_id = 'a'.repeat(32);
+      const cursor = buildTestEntry({ agentType: ClientType.Cursor });
+      cursor.trace_id = 'b'.repeat(32);
+      input.emit('entries', [droid, cursor]);
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      expect(stamp).toHaveBeenCalledTimes(1);
+      expect(stamp.mock.calls[0][0]).toEqual([cursor]);
+      expect(flusher.batchCalls[0][0].trace_id).toBe('a'.repeat(32));
+      expect(flusher.batchCalls[0][1].trace_id).toBe('f'.repeat(32));
     });
   });
 
@@ -342,6 +375,30 @@ describe('InputManager', () => {
         expect(JSON.stringify(child.batchCalls[0][0])).not.toContain(phone);
       }
     });
+
+    it('always applies the full mask plan to Droid transcript content', async () => {
+      const input = new StubInput('droid-transcript');
+      manager.registerInput(input as any);
+      manager.setMaskConfig({ mode: 'none', types: [] });
+
+      const apiKey = ['sk-', '1234567890abcdefghijklmnop'].join('');
+      const email = 'droid-owner@example.com';
+      const entry = buildTestEntry({
+        agentType: 'droid' as ClientType,
+        'gen_ai.output.messages': [
+          { role: 'assistant', parts: [{ type: 'text', content: `${apiKey} ${email}` }] },
+        ],
+      });
+
+      input.emit('entries', [entry]);
+      await new Promise(r => setTimeout(r, 50));
+
+      const serialized = JSON.stringify(flusher.batchCalls[0][0]);
+      expect(serialized).toContain('[APIKEY_MASKED]');
+      expect(serialized).toContain('[EMAIL_MASKED]');
+      expect(serialized).not.toContain(apiKey);
+      expect(serialized).not.toContain(email);
+    });
   });
 
   describe('registerInput deduplication (T032)', () => {
@@ -474,6 +531,16 @@ describe('InputManager', () => {
       input.emit('entries', [buildTestEntry()]);
       await new Promise(r => setTimeout(r, 50));
       // No crash, entries silently dropped
+    });
+
+    it('rejects Droid source acceptance when no durable flusher is set', async () => {
+      const mgr = new InputManager();
+      const input = new StubInput('droid-transcript');
+      mgr.registerInput(input as any);
+
+      await expect(input.deliver([
+        buildTestEntry({ agentType: 'droid' as ClientType }),
+      ])).rejects.toThrow('Droid collection requires a durable OTLP batch sink');
     });
   });
 });

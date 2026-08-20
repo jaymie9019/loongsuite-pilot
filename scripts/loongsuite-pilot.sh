@@ -77,8 +77,15 @@ resolve_user_home() {
 }
 
 ensure_dirs() {
+    # All files below DATA_DIR may contain credentials or captured model/tool
+    # content.  Keep newly-created files private even when the caller has a
+    # permissive shell umask, and repair directory modes from older installs.
+    umask 077
+    mkdir -p "$DATA_DIR"
+    mkdir -p "$CACHE_DIR"
     mkdir -p "$LOG_DIR"
     mkdir -p "$BOOTSTRAP_DIR"
+    chmod 700 "$DATA_DIR" "$CACHE_DIR" "$LOG_DIR" "$BOOTSTRAP_DIR" 2>/dev/null || true
 }
 
 sync_bootstrap_scripts() {
@@ -95,15 +102,19 @@ sync_bootstrap_scripts() {
 sync_installed_scripts_from_version() {
     local version_dir="$1"
     local src_dir="$version_dir/scripts"
-    if [ ! -f "$src_dir/collector-daemon.js" ] || [ ! -f "$src_dir/updater-daemon.js" ] || [ ! -f "$src_dir/loongsuite-pilot.sh" ]; then
+    if [ ! -f "$src_dir/collector-daemon.js" ] || [ ! -f "$src_dir/loongsuite-pilot.sh" ]; then
         return 1
     fi
 
     mkdir -p "$BOOTSTRAP_DIR"
     cp -f "$src_dir/collector-daemon.js" "$BOOTSTRAP_DIR/collector-daemon.js.tmp"
     mv -f "$BOOTSTRAP_DIR/collector-daemon.js.tmp" "$BOOTSTRAP_DIR/collector-daemon.js"
-    cp -f "$src_dir/updater-daemon.js" "$BOOTSTRAP_DIR/updater-daemon.js.tmp"
-    mv -f "$BOOTSTRAP_DIR/updater-daemon.js.tmp" "$BOOTSTRAP_DIR/updater-daemon.js"
+    if [ -f "$src_dir/updater-daemon.js" ]; then
+        cp -f "$src_dir/updater-daemon.js" "$BOOTSTRAP_DIR/updater-daemon.js.tmp"
+        mv -f "$BOOTSTRAP_DIR/updater-daemon.js.tmp" "$BOOTSTRAP_DIR/updater-daemon.js"
+    else
+        rm -f "$BOOTSTRAP_DIR/updater-daemon.js"
+    fi
 
     mkdir -p "$(dirname "$LOONGSUITE_PILOT_BIN")"
     cp -f "$src_dir/loongsuite-pilot.sh" "$LOONGSUITE_PILOT_BIN.tmp"
@@ -1151,7 +1162,32 @@ cmd_info() {
 
     echo ""
     if [ -f "$CONFIG_FILE" ]; then
-        cat "$CONFIG_FILE"
+        local node_bin
+        node_bin=$(resolve_node 2>/dev/null) || true
+        if [ -n "$node_bin" ]; then
+            "$node_bin" -e '
+const fs = require("fs");
+const file = process.argv[1];
+const sensitive = /^(licenseKey|accessKeySecret|apiKey|authorization|headers?|password|token)$/i;
+function redact(value) {
+  if (Array.isArray(value)) return value.map(redact);
+  if (!value || typeof value !== "object") return value;
+  const out = {};
+  for (const [key, child] of Object.entries(value)) {
+    out[key] = sensitive.test(key) ? "[REDACTED]" : redact(child);
+  }
+  return out;
+}
+try {
+  const config = JSON.parse(fs.readFileSync(file, "utf8"));
+  process.stdout.write(JSON.stringify(redact(config), null, 2) + "\n");
+} catch {
+  process.stdout.write("(config exists but could not be parsed)\n");
+}
+' "$CONFIG_FILE"
+        else
+            echo "(config redacted: node runtime unavailable)"
+        fi
     fi
 }
 
@@ -1276,6 +1312,86 @@ cmd_token_usage() {
 
     export AGENT_DATA_COLLECTION_CONFIG="$CONFIG_FILE"
     exec "$node_bin" "$entry" token-usage "$@"
+}
+
+cmd_droid() {
+    ensure_dirs
+
+    local repo_dir version_dir entry candidate node_bin
+    repo_dir="$(dirname "$SCRIPT_DIR")"
+    entry=""
+
+    if [ -f "$repo_dir/package.json" ] && [ -d "$repo_dir/src" ]; then
+        if [ -f "$repo_dir/dist/index.js" ]; then
+            entry="$repo_dir/dist/index.js"
+        else
+            echo "❌ local dist/index.js not found; run 'npm run build' first"
+            exit 1
+        fi
+    else
+        version_dir=$(resolve_current_version 2>/dev/null) || true
+        for candidate in \
+            "${version_dir:-}/dist/index.js" \
+            "$PACKAGE_DIR/dist/index.js"; do
+            if [ -f "$candidate" ]; then
+                entry="$candidate"
+                break
+            fi
+        done
+    fi
+
+    if [ -z "$entry" ]; then
+        echo "❌ loongsuite-pilot runtime entry not found"
+        exit 1
+    fi
+
+    node_bin=$(resolve_node) || {
+        echo "❌ node runtime not found" >&2
+        exit 1
+    }
+
+    export AGENT_DATA_COLLECTION_CONFIG="$CONFIG_FILE"
+    exec "$node_bin" "$entry" droid "$@"
+}
+
+cmd_failed() {
+    ensure_dirs
+
+    local repo_dir version_dir entry candidate node_bin
+    repo_dir="$(dirname "$SCRIPT_DIR")"
+    entry=""
+
+    if [ -f "$repo_dir/package.json" ] && [ -d "$repo_dir/src" ]; then
+        if [ -f "$repo_dir/dist/index.js" ]; then
+            entry="$repo_dir/dist/index.js"
+        else
+            echo "❌ local dist/index.js not found; run 'npm run build' first"
+            exit 1
+        fi
+    else
+        version_dir=$(resolve_current_version 2>/dev/null) || true
+        for candidate in \
+            "${version_dir:-}/dist/index.js" \
+            "$PACKAGE_DIR/dist/index.js"; do
+            if [ -f "$candidate" ]; then
+                entry="$candidate"
+                break
+            fi
+        done
+    fi
+
+    if [ -z "$entry" ]; then
+        echo "❌ loongsuite-pilot runtime entry not found"
+        exit 1
+    fi
+
+    node_bin=$(resolve_node) || {
+        echo "❌ node runtime not found" >&2
+        exit 1
+    }
+
+    export AGENT_DATA_COLLECTION_CONFIG="$CONFIG_FILE"
+    exec "$node_bin" "$entry" failed "$@"
 }
 
 cleanup_hermes_for_rollback() {
@@ -2214,6 +2330,8 @@ cmd_help() {
     echo "                    --json           machine-readable result"
     echo "  token-usage     Show token usage TUI"
     echo "  agent ...       Register/list/diagnose PI SDK Agents"
+    echo "  droid replay    Inspect or explicitly enqueue Factory Droid history"
+    echo "  failed replay   Inspect or explicitly retry the durable OTLP queue"
     echo "  span-attr ...   Manage custom trace span attributes (set/unset/list/clear)"
     echo "  worker ...      Manage local remote-controlled workers"
     echo "  rollback        Roll back to the previous version"
@@ -2231,6 +2349,8 @@ case "${1:-status}" in
     deploy)      shift; cmd_deploy "$@" ;;
     token-usage) shift; cmd_token_usage "$@" ;;
     tokens)      shift; cmd_token_usage "$@" ;;
+    droid)       shift; cmd_droid "$@" ;;
+    failed)      shift; cmd_failed "$@" ;;
     span-attr)   shift; cmd_span_attr "$@" ;;
     worker)              shift; cmd_worker "$@" ;;
     agent)               shift; cmd_agent "$@" ;;

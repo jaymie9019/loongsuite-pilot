@@ -100,6 +100,19 @@ function extractOpenClawCleanupScripts() {
   ];
 }
 
+function extractGenericHookCleanupScripts() {
+  const shFunction = sh.indexOf('remove_hook_configs()');
+  const shMarker = 'node - "$cfg" "$managed_hooks_dir" <<\'NODE\' && ok=1\n';
+  const shStart = sh.indexOf(shMarker, shFunction);
+  const psFunction = ps1.indexOf('function Remove-HookConfigs');
+  const psMarker = "& $script:NODE_BIN -e @'\n";
+  const psStart = ps1.indexOf(psMarker, psFunction);
+  return [
+    ['sh', sh.slice(shStart + shMarker.length, sh.indexOf('\nNODE', shStart))],
+    ['ps1', ps1.slice(psStart + psMarker.length, ps1.indexOf("\n'@ $cfg $managedHooksDir", psStart))],
+  ];
+}
+
 // Derive lifecycle coverage from the deployment manifests. New hook agents
 // must not require a second hand-maintained list in this test.
 const HOOK_CONFIG_FILES = [...new Set(
@@ -111,6 +124,13 @@ const HOOK_CONFIG_FILES = [...new Set(
 )].sort();
 
 describe('uninstall cleans hook configs for all hook agents', () => {
+  it('keeps the shell installer syntactically valid', () => {
+    const result = spawnSync('bash', ['-n', resolve('deploy', 'installer-opensource.sh')], {
+      encoding: 'utf8',
+    });
+    expect(result.status, result.stderr).toBe(0);
+  });
+
   for (const f of HOOK_CONFIG_FILES) {
     it(`sh remove_hook_configs includes ${f}`, () => {
       expect(sh).toContain(`$HOME/${f}`);
@@ -129,7 +149,92 @@ describe('uninstall cleans hook configs for all hook agents', () => {
     );
     expect(cleanup).toContain('if (Object.keys(hooks).length === 0)');
     expect(cleanup).toContain('delete data.hooks');
+    expect(cleanup).toContain('$nodeExit = $LASTEXITCODE');
+    expect(cleanup).toContain('if ($nodeExit -ne 0)');
   });
+
+  it.each(extractGenericHookCleanupScripts())(
+    '%s removes only Pilot commands from a shared nested hook group',
+    (_platform, cleanupScript) => {
+      const configPath = '/tmp/factory-settings.json';
+      const marker = '.loongsuite-pilot';
+      const original = {
+        model: 'user-model',
+        hooks: {
+          Stop: [
+            {
+              matcher: '*',
+              hooks: [
+                { type: 'command', command: '/opt/user-stop-hook.sh' },
+                { type: 'command', command: '/tmp/.loongsuite-pilot/hooks/droid-loongsuite-pilot-hook.sh stop' },
+              ],
+            },
+            { command: '/opt/user-direct-hook.sh' },
+            { command: '/opt/user-loongsuite-pilot-hook.sh stop' },
+            { command: '/opt/user-cache-hook.sh --cache ~/.loongsuite-pilot' },
+            { command: '/tmp/.loongsuite-pilot/hooks/cursor-loongsuite-pilot-hook.sh stop' },
+          ],
+          SessionEnd: [{
+            matcher: '*',
+            hooks: [{ command: '/tmp/.loongsuite-pilot/hooks/droid-loongsuite-pilot-hook.sh session-end' }],
+          }],
+        },
+      };
+      let writtenConfig;
+      let restoredMode;
+      const fs = {
+        statSync(target) {
+          expect(target).toBe(configPath);
+          return { mode: 0o100600 };
+        },
+        readFileSync(target, encoding) {
+          expect(target).toBe(configPath);
+          expect(encoding).toBe('utf-8');
+          return JSON.stringify(original);
+        },
+        writeFileSync(target, value, encoding) {
+          expect(target).toBe(configPath);
+          expect(encoding).toBe('utf-8');
+          writtenConfig = value;
+        },
+        chmodSync(target, mode) {
+          expect(target).toBe(configPath);
+          restoredMode = mode;
+        },
+      };
+      let stdout = '';
+      runInNewContext(cleanupScript, {
+        process: {
+          argv: ['node', configPath, '/tmp/.loongsuite-pilot/hooks'],
+          stdout: { write: value => { stdout += value; } },
+          stderr: { write: () => {} },
+          exit: code => { throw new Error(`cleanup unexpectedly exited with ${code}`); },
+        },
+        require(id) {
+          expect(id).toBe('fs');
+          return fs;
+        },
+      });
+
+      expect(stdout).toBe(_platform === 'sh' ? 'cleaned' : '');
+      expect(restoredMode).toBe(0o600);
+      const cleaned = JSON.parse(writtenConfig);
+      expect(cleaned).toEqual({
+        model: 'user-model',
+        hooks: {
+          Stop: [
+            {
+              matcher: '*',
+              hooks: [{ type: 'command', command: '/opt/user-stop-hook.sh' }],
+            },
+            { command: '/opt/user-direct-hook.sh' },
+            { command: '/opt/user-loongsuite-pilot-hook.sh stop' },
+            { command: '/opt/user-cache-hook.sh --cache ~/.loongsuite-pilot' },
+          ],
+        },
+      });
+    },
+  );
 });
 
 describe('uninstall cleans the OpenCode plugin-inject spec', () => {

@@ -53,6 +53,8 @@ const mockResolveHome = vi.fn((p: string) => p.replace(/^~/, '/home/test'));
 
 vi.mock('../../../src/utils/fs-utils.js', () => ({
   ensureDir: (...args: unknown[]) => mockEnsureDir(...args),
+  ensurePrivateDir: (...args: unknown[]) => mockEnsureDir(...args),
+  hardenPrivateTree: vi.fn().mockResolvedValue(undefined),
   resolveHome: (p: string) => mockResolveHome(p),
   readJsonFile: vi.fn().mockResolvedValue(null),
   writeJsonFile: vi.fn().mockResolvedValue(undefined),

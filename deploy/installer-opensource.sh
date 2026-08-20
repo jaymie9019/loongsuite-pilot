@@ -206,6 +206,61 @@ detect_lang() {
 LANG_MODE=$(detect_lang)
 msg() { [ "$LANG_MODE" = "zh" ] && echo "$1" || echo "$2"; }
 
+# >>> startup-readiness >>>
+# Starting the collector process is not the same as completing its cold-start
+# scan. The runtime writer is started only after the orchestrator is ready, so
+# this file is the installer-facing readiness contract.
+wait_for_startup_readiness() {
+    local timeout_seconds="${LOONGSUITE_PILOT_STARTUP_READY_TIMEOUT_SECONDS:-600}"
+    local poll_seconds="${LOONGSUITE_PILOT_STARTUP_READY_POLL_SECONDS:-2}"
+    local max_age_seconds="${LOONGSUITE_PILOT_STARTUP_READY_MAX_AGE_SECONDS:-120}"
+    local runtime_file="$DATA_DIR/logs/runtime.json"
+    local pid_file="$DATA_DIR/loongsuite-pilot.pid"
+
+    case "$timeout_seconds" in ''|*[!0-9]*) timeout_seconds=600 ;; esac
+    case "$poll_seconds" in ''|*[!0-9]*) poll_seconds=2 ;; esac
+    case "$max_age_seconds" in ''|*[!0-9]*) max_age_seconds=120 ;; esac
+
+    local deadline=$(( $(date +%s) + timeout_seconds ))
+    while true; do
+        local ready_pid=""
+        ready_pid=$("$NODE_BIN" - "$runtime_file" "$pid_file" "$max_age_seconds" <<'NODE' 2>/dev/null
+const fs = require('fs');
+const [runtimeFile, pidFile, maxAgeArg] = process.argv.slice(2);
+try {
+  const pidText = fs.readFileSync(pidFile, 'utf8').trim();
+  if (!/^[1-9][0-9]*$/.test(pidText)) process.exit(1);
+  const pid = Number(pidText);
+  const runtime = JSON.parse(fs.readFileSync(runtimeFile, 'utf8'));
+  const updatedAtMs = Date.parse(runtime.updatedAt);
+  const ageMs = Date.now() - updatedAtMs;
+  const maxAgeMs = Number(maxAgeArg) * 1000;
+  if (runtime.status !== 'active'
+      || !Number.isSafeInteger(runtime.pid)
+      || runtime.pid !== pid
+      || !Number.isFinite(updatedAtMs)
+      || ageMs < -5000
+      || ageMs > maxAgeMs) {
+    process.exit(1);
+  }
+  process.stdout.write(String(pid));
+} catch {
+  process.exit(1);
+}
+NODE
+        ) || ready_pid=""
+
+        if [ -n "$ready_pid" ] && kill -0 "$ready_pid" 2>/dev/null; then
+            return 0
+        fi
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            return 1
+        fi
+        sleep "$poll_seconds"
+    done
+}
+# <<< startup-readiness <<<
+
 # ============================================================
 # Common: check dependencies
 # ============================================================
@@ -953,7 +1008,9 @@ write_config() {
     local config_file="$DATA_DIR/config.json"
     msg "==> 写入配置文件 $config_file ..." \
         "==> Writing config to $config_file ..."
+    umask 077
     mkdir -p "$DATA_DIR"
+    chmod 700 "$DATA_DIR" 2>/dev/null || true
 
     printf '%s' "$PROBE_RESULT" | \
         LP_SLS_API_KEY="$SLS_API_KEY" \
@@ -1072,7 +1129,8 @@ if (selectedAgents) {
   }
 }
 
-fs.writeFileSync(path, JSON.stringify(config, null, 2) + '\n');
+fs.writeFileSync(path, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+fs.chmodSync(path, 0o600);
 "
     msg "    ✅ 配置已写入" "    ✅ Config written"
     echo ""
@@ -1858,14 +1916,12 @@ cmd_install() {
 
     msg "==> 启动服务..." "==> Starting service..."
     if loongsuite-pilot start; then
-        sleep 2
-        local _status_out
-        _status_out="$(loongsuite-pilot status 2>/dev/null || true)"
-        if echo "$_status_out" | grep -q "is running"; then
+        msg "    等待服务完成启动..." "    Waiting for the service to become ready..."
+        if wait_for_startup_readiness; then
             msg "    ✅ 服务已启动" "    ✅ Service started"
         else
-            msg "    ⚠️  服务可能尚未就绪，请检查: loongsuite-pilot status" \
-                "    ⚠️  Service may not be ready. Check: loongsuite-pilot status"
+            msg "    ⚠️  服务未在启动超时前就绪；安装已完成，请稍后检查日志" \
+                "    ⚠️  Service did not become ready before the startup timeout; installation completed, check logs shortly"
         fi
     else
         msg "    ⚠️  服务启动失败，请手动运行: loongsuite-pilot start" \
@@ -1963,10 +2019,8 @@ cmd_upgrade() {
     # Start the new version
     msg "==> 启动新版本..." "==> Starting new version..."
     if loongsuite-pilot start; then
-        sleep 2
-        local _status_out
-        _status_out="$(loongsuite-pilot status 2>/dev/null || true)"
-        if echo "$_status_out" | grep -q "is running"; then
+        msg "    等待新版本完成启动..." "    Waiting for the new version to become ready..."
+        if wait_for_startup_readiness; then
             msg "    ✅ 新版本启动成功" "    ✅ New version started successfully"
             echo ""
 
@@ -2040,6 +2094,7 @@ gc_old_versions() {
 # ============================================================
 remove_hook_configs() {
     local HOOK_MARKER=".loongsuite-pilot"
+    local managed_hooks_dir="$DATA_DIR/hooks"
     local configs=(
         "$HOME/.cursor/hooks.json"
         "$HOME/.qoder/settings.json"
@@ -2052,6 +2107,7 @@ remove_hook_configs() {
         "$HOME/.kiro/agents/pilot-kiro.json"
         "$HOME/.qwen/settings.json"
         "$HOME/.workbuddy/settings.json"
+        "$HOME/.factory/settings.json"
     )
 
     local _has_node=0
@@ -2068,35 +2124,54 @@ remove_hook_configs() {
 
         local ok=0
         if [ "$_has_node" -eq 1 ]; then
-            node -e "
+            node - "$cfg" "$managed_hooks_dir" <<'NODE' && ok=1
 const fs = require('fs');
-const cfg = process.argv[1];
-const marker = process.argv[2];
+const cfg = process.argv[process.argv.length - 2];
+const managedHooksDir = String(process.argv[process.argv.length - 1] || '').replace(/\\/g, '/').replace(/\/+$/, '');
+const escapeRegex = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const managedHookPattern = new RegExp(
+  '(?:^|[\\s"\'&])' + escapeRegex(managedHooksDir)
+    + '/[^/\\s"\']*loongsuite-pilot-hook\\.(?:sh|ps1)(?=["\'\\s]|$)',
+  'i',
+);
+const isManagedHookCommand = command => typeof command === 'string'
+  && managedHooksDir.length > 0
+  && managedHookPattern.test(command.replace(/\\/g, '/'));
 try {
+  const originalMode = fs.statSync(cfg).mode & 0o777;
   const data = JSON.parse(fs.readFileSync(cfg, 'utf-8'));
   const hooks = data.hooks;
   if (!hooks || typeof hooks !== 'object') process.exit(0);
   let changed = false;
   for (const [event, entries] of Object.entries(hooks)) {
     if (!Array.isArray(entries)) continue;
-    const filtered = entries.filter(e => {
-      const cmd = e.command || '';
-      const nested = Array.isArray(e.hooks) ? e.hooks : [];
-      const hasMarker = cmd.includes(marker) || nested.some(h => (h.command || '').includes(marker));
-      if (hasMarker) changed = true;
-      return !hasMarker;
-    });
+    const filtered = [];
+    for (const e of entries) {
+      if (!e || typeof e !== 'object') { filtered.push(e); continue; }
+      const cmd = typeof e.command === 'string' ? e.command : '';
+      if (isManagedHookCommand(cmd)) { changed = true; continue; }
+      if (!Array.isArray(e.hooks)) { filtered.push(e); continue; }
+      const nested = e.hooks.filter(h =>
+        !h || typeof h !== 'object' || !isManagedHookCommand(h.command));
+      if (nested.length === e.hooks.length) { filtered.push(e); continue; }
+      changed = true;
+      // A nested group belongs to the user as a whole. Remove only Pilot's
+      // command and retain sibling hooks and matcher metadata verbatim.
+      if (nested.length > 0) filtered.push({ ...e, hooks: nested });
+    }
     if (filtered.length === 0) { delete hooks[event]; changed = true; }
     else hooks[event] = filtered;
   }
+  if (Object.keys(hooks).length === 0) delete data.hooks;
   if (changed) {
     fs.writeFileSync(cfg, JSON.stringify(data, null, 2) + '\n', 'utf-8');
+    fs.chmodSync(cfg, originalMode);
     process.stdout.write('cleaned');
   } else {
     process.stdout.write('skip');
   }
 } catch(e) { process.stderr.write(e.message); process.exit(1); }
-" "$cfg" "$HOOK_MARKER" && ok=1
+NODE
         else
             # Node unavailable: skip auto-cleanup to avoid over-deletion
             if grep -q "$HOOK_MARKER" "$cfg" 2>/dev/null; then

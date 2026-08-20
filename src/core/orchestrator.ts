@@ -18,7 +18,7 @@ import {
 } from '../pi-sdk/pi-sdk-agent-registry.js';
 import { GlobalAttributesProvider } from '../normalization/global-attributes.js';
 import { createLogger } from '../utils/logger.js';
-import { resolveHome, ensureDir, directoryExists, readJsonFile, writeJsonFile, fileExists, readInstalledVersion, cleanStaleTmpFiles } from '../utils/fs-utils.js';
+import { resolveHome, ensureDir, ensurePrivateDir, hardenPrivateTree, directoryExists, readJsonFile, writeJsonFile, fileExists, readInstalledVersion, cleanStaleTmpFiles } from '../utils/fs-utils.js';
 import * as path from 'node:path';
 import * as fsSync from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -61,6 +61,7 @@ import { DshLogInput, ensureDshLogDir } from '../inputs/dsh-log/dsh-log-input.js
 import { OpenClawPluginInput, ensureOpenClawPluginLogDir } from '../inputs/openclaw-plugin/openclaw-plugin-input.js';
 import { WukongInput } from '../inputs/wukong/wukong-input.js';
 import { WorkBuddyInput } from '../inputs/workbuddy/workbuddy-input.js';
+import { DroidInput } from '../inputs/droid/droid-input.js';
 
 import { LogRetentionService } from './log-retention-service.js';
 import { CorrelationStore } from './upstream-link/correlation-store.js';
@@ -135,6 +136,7 @@ export class Orchestrator extends EventEmitter {
     'wukong': 'wukong',
     'workbuddy': 'workbuddy',
     'dsh-log': 'dsh',
+    'droid-transcript': 'droid',
   };
 
   private readonly config: AnalyticsConfig;
@@ -179,8 +181,13 @@ export class Orchestrator extends EventEmitter {
     this.emit('starting');
 
     // 1. Ensure data directories
-    await ensureDir(this.dataDir);
-    await ensureDir(path.join(this.dataDir, 'logs'));
+    await ensurePrivateDir(this.dataDir);
+    await ensurePrivateDir(path.join(this.dataDir, 'logs'));
+    await Promise.all([
+      hardenPrivateTree(path.join(this.dataDir, 'logs')),
+      hardenPrivateTree(path.join(this.dataDir, 'state')),
+      hardenPrivateTree(path.join(this.dataDir, 'spool')),
+    ]);
     await cleanStaleTmpFiles(path.join(this.dataDir, 'logs'));
 
     // 2. Load state & agent-control config
@@ -1517,6 +1524,27 @@ export class Orchestrator extends EventEmitter {
             listenerCfg.workbuddy?.enabled ?? true,
           ),
         pollIntervalMs: listenerCfg.workbuddy?.pollInterval,
+      }),
+    );
+
+    // --- Factory Droid (Hook wakeups + transcript/settings/log join) ---
+    const droidInput = new DroidInput({
+      stateStore: this.stateStore,
+      hookEventDir: path.join(this.dataDir, 'state', 'droid', 'hook-events'),
+      pollIntervalMs: listenerCfg['droid-transcript']?.pollInterval,
+    });
+    this.inputManager.registerInput(droidInput);
+    entries.push(
+      this.inputManager.buildDetectionEntry(droidInput, {
+        watchPaths: DroidInput.getWatchPaths(),
+        isAvailable: DroidInput.checkAvailability,
+        enabled: () => this.isAgentGatedEnabled(
+          Orchestrator.LISTENER_AGENT_MAP['droid-transcript'],
+        ) && this.agentControlManager.resolveEnabled(
+          'droid-transcript',
+          listenerCfg['droid-transcript']?.enabled ?? true,
+        ),
+        pollIntervalMs: listenerCfg['droid-transcript']?.pollInterval,
       }),
     );
 

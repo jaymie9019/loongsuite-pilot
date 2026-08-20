@@ -17,6 +17,7 @@ type differences are called out in the notes.
 | Cursor | `cursor` | Hook integration. |
 | Cursor CLI | `cursor-cli` | Detected and emitted as `cursor-cli`, but reuses Cursor's installed Hook/input pipeline rather than deploying an independent Hook. Use `cursor-cli` for an output-specific content policy. |
 | DeepSeek Harness | `dsh` | User-level YAML patch plugin plus local per-session JSONL polling. Captures native LLM, reasoning, tool, token, and TTFT data. |
+| Factory Droid | `droid` | Structural Hook wakeups plus local transcript, settings, and version-gated log collection. Output records use `gen_ai.agent.type=droid`. |
 | Hermes Agent | `hermes-agent` | Native directory plugin and local session-file collection. Output records use `gen_ai.agent.type=hermes`. |
 | Kiro CLI | `kiro-cli` | Hook integration with delayed local SQLite/session collection. Token usage is not exposed by the source. |
 | MiMo Code | `mimo-code` | Plugin injection; captures LLM, tool, and token lifecycle events. |
@@ -70,6 +71,91 @@ watchdog repairs the block while DSH remains enabled. Uninstall performs the
 same owned-block cleanup before removing plugin assets and preserves unrelated
 YAML content. If the source lacks a request boundary or an output delta, Pilot
 omits TTFT instead of fabricating zero.
+
+## Factory Droid Collection And Replay
+
+Pilot's supported Droid contract is transcript schema v2. Live collection and
+replay fail closed for another transcript version, and exact log enrichment is
+explicitly version-gated to Droid `0.199.0` and `0.200.0`. This prevents a
+changed local format from being silently interpreted as a verified schema.
+
+The sources have deliberately different authority:
+
+1. The transcript is authoritative for session, turn, LLM, tool, and visible
+   message structure. `user_only` and `llm_only` records are not exported as
+   conversation content.
+2. The sibling session settings file supplies model/provider fallback and
+   aggregate token usage when a precise call-level match is unavailable.
+3. Retained Droid `0.199.0` or `0.200.0` logs may enrich a uniquely matched
+   call with exact per-call token usage, request/response timing, TTFT, and
+   response ID. Pilot does not guess when the join is ambiguous.
+
+Consequently, an old transcript can still be replayed without its log, but
+exact historical per-call token counts are guaranteed only while the matching
+log records remain. Depending on the available settings baseline, Pilot marks
+less precise usage as `single_call_delta`, `turn_aggregate`,
+`session_aggregate`, or `missing` instead of assigning an aggregate to an
+arbitrary call.
+
+Droid Hooks contain only structural wakeup data; transcript content, tool
+arguments, and tool results are read from their source files. Hook deployment
+appends Pilot entries and uninstall removes only those entries, preserving
+unrelated user Hooks. Polling remains the fallback if a Hook is delayed or
+missing. This integration intentionally does not depend on Droid's native OTLP
+output: Pilot builds the AgentLoop session/turn/step/LLM/tool topology from the
+local sources above.
+
+If Droid message capture is disabled, Pilot removes prompt, completion, tool
+argument, and tool result fields. If it is enabled, Droid content still passes
+the complete Pilot `mode=all` secret and PII mask plan even when the global
+mask setting is `none`.
+
+Inspect complete historical turns without mutation:
+
+```bash
+loongsuite-pilot droid replay --session-id <ID> --dry-run
+loongsuite-pilot droid replay --from <ISO_TIME> --to <ISO_TIME> --dry-run
+```
+
+Dry-run skips incomplete turns and unsupported transcripts, applies the same
+content policy plus forced `mode=all` masking, and prints no prompt or tool
+content. It also reads `logs/input-state.json` to produce a strict eligibility
+summary. A transcript handled by live collection is conservatively excluded as
+a whole and reported by `liveProcessedSkipped`; missing, incomplete, pending,
+or changed baseline receipts are reported by `unsafeStateSkipped` and
+`safetySkipReasons`.
+
+`droid replay --execute` is temporarily disabled and always exits 1 before
+source, queue, or ledger access. AgentLoop does not deduplicate a live span and
+a replay span that share the same trace/span IDs. Moreover, queue-first remote
+success followed by a ledger-write crash can enqueue the same history again.
+Safe enablement requires a shared live/replay outbox/receipt that atomically
+coordinates source ownership, durable enqueue, and replay acknowledgement.
+There is no force override in this release.
+
+The durable queue provides atomic file creation, fsync, deterministic
+at-least-once de-duplication, restart recovery, and retry after local spool
+acceptance. Retryable network/408/429/5xx failures remain pending, HTTP 400
+moves an item to dead-letter, and 401/403 pauses that route. This guarantee
+starts when the item reaches `spool/otlp/v1`. Droid live collection commits
+its source checkpoint and removes its hook event only after every configured
+durable route has accepted the batch locally. If that local write fails, the
+transcript offset and hook remain retryable; deterministic IDs make the retry
+stable. This source-to-spool acknowledgment applies to Droid, while existing
+inputs that have not adopted the same contract can retain an earlier crash
+window.
+
+Inspect queue inventory without reading payloads, or explicitly request one
+immediate delivery pass:
+
+```bash
+loongsuite-pilot failed replay --dry-run
+loongsuite-pilot failed replay --execute
+```
+
+Old `logs/otlp-failed` JSONL is listed by this command but never automatically
+replayed: that legacy format omitted scope, events, and links, so a lossless
+migration is impossible.
 
 ## OpenClaw Compatibility And Lifecycle
 
@@ -154,6 +240,7 @@ Use `config.json` when you need to control message content capture:
     "claude-code": { "enabled": true, "captureMessageContent": false },
     "codex": { "enabled": true, "captureMessageContent": false },
     "dsh": { "enabled": true, "captureMessageContent": false },
+    "droid": { "enabled": true, "captureMessageContent": false },
     "openclaw": { "enabled": true, "captureMessageContent": false },
     "cursor": { "enabled": true, "captureMessageContent": true }
   }
@@ -167,6 +254,8 @@ Use `config.json` when you need to control message content capture:
 | `multimodal.uploadMode` | Multimodal upload policy. `none` (default) disables; `input` / `tool` / `output` / `both` select conversion surfaces. See [Multimodal Collection](multimodal.md). |
 
 For sensitive environments, pair `captureMessageContent: false` with [Data Masking](masking.md). To collect multimodal data, see [Multimodal Collection](multimodal.md) (images only; `codex` only today).
+For sensitive environments, pair `captureMessageContent: false` with [Data Masking](masking.md).
+For Droid, enabling content never bypasses the forced complete `mode=all` mask plan.
 
 ## Verify Agent Collection
 

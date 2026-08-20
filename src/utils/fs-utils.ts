@@ -62,6 +62,8 @@ export interface AtomicTextWriteOptions {
    * Only applies when the expected target already exists.
    */
   backupPath?: string;
+  /** Exact permissions for the replacement file (POSIX); useful for secrets/config. */
+  mode?: number;
 }
 
 async function assertExpectedFileState(
@@ -110,7 +112,8 @@ export async function writeTextFileAtomic(
 
   const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
   try {
-    await fsp.writeFile(tmp, text, 'utf8');
+    await fsp.writeFile(tmp, text, { encoding: 'utf8', mode: options.mode });
+    if (options.mode !== undefined) await fsp.chmod(tmp, options.mode);
     // Re-check after preparing the temporary file. This narrows the remaining
     // race to the final compare-and-rename window.
     if (options.expected) {
@@ -126,7 +129,8 @@ export async function writeTextFileAtomic(
       await ensureDir(dir);
       const tmp2 = `${path}.${process.pid}.${Date.now()}.tmp`;
       try {
-        await fsp.writeFile(tmp2, text, 'utf8');
+        await fsp.writeFile(tmp2, text, { encoding: 'utf8', mode: options.mode });
+        if (options.mode !== undefined) await fsp.chmod(tmp2, options.mode);
         if (options.expected) {
           await assertExpectedFileState(path, options.expected);
         }
@@ -219,6 +223,61 @@ export async function ensureDir(path: string): Promise<void> {
   try {
     await fsp.mkdir(path, { recursive: true });
   } catch {}
+}
+
+/**
+ * Create (or repair) a directory that stores Pilot credentials, checkpoints,
+ * captured model content, or transport spool data. Permission repair is
+ * best-effort so read-only installations still start and can report the real
+ * I/O failure at the point where data is written.
+ */
+export async function ensurePrivateDir(path: string): Promise<void> {
+  if (!path || path === '.' || path === nodePath.parse(path).root) return;
+  try {
+    await fsp.mkdir(path, { recursive: true, mode: 0o700 });
+    if (process.platform !== 'win32') await fsp.chmod(path, 0o700);
+  } catch {}
+}
+
+/** Best-effort permission repair for an existing sensitive Pilot file. */
+export async function ensurePrivateFile(path: string): Promise<void> {
+  if (process.platform === 'win32') return;
+  try {
+    await fsp.chmod(path, 0o600);
+  } catch {}
+}
+
+/**
+ * Best-effort permission repair for an existing sensitive data subtree. This
+ * never follows symlinks and is deliberately bounded so startup cannot be
+ * trapped by an unexpectedly large or hostile directory tree.
+ */
+export async function hardenPrivateTree(root: string, maxEntries = 10_000): Promise<void> {
+  if (!root || root === '.' || root === nodePath.parse(root).root || process.platform === 'win32') {
+    return;
+  }
+  const pending = [root];
+  let visited = 0;
+  while (pending.length > 0 && visited < maxEntries) {
+    const current = pending.pop()!;
+    try {
+      const stat = await fsp.lstat(current);
+      visited++;
+      if (stat.isSymbolicLink()) continue;
+      if (stat.isFile()) {
+        await fsp.chmod(current, 0o600);
+        continue;
+      }
+      if (!stat.isDirectory()) continue;
+      await fsp.chmod(current, 0o700);
+      const entries = await fsp.readdir(current, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isSymbolicLink()) pending.push(nodePath.join(current, entry.name));
+      }
+    } catch {
+      // Read-only and concurrently-rotated paths remain non-fatal.
+    }
+  }
 }
 
 /**

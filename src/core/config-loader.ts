@@ -34,7 +34,7 @@ import {
   MULTIMODAL_UPLOADER_KINDS,
   SUPPORTED_MASK_TYPES,
 } from '../types/index.js';
-import { readJsonFile, resolveHome } from '../utils/fs-utils.js';
+import { ensurePrivateFile, readJsonFile, resolveHome } from '../utils/fs-utils.js';
 import { createLogger } from '../utils/logger.js';
 import { parseKeyValueAttributes, sanitizeAttributes } from '../normalization/global-attributes.js';
 
@@ -262,6 +262,9 @@ function envInt(key: string, fallback: number): number {
 export async function loadConfig(): Promise<AnalyticsConfig> {
   const configPath = resolveHome(env('AGENT_DATA_COLLECTION_CONFIG') ?? DEFAULT_CONFIG_PATH);
   const file = await readJsonFile<ConfigFile>(configPath);
+  // Existing installs may predate the private-mode installer. The config can
+  // contain CMS/OTLP credentials, so repair its mode whenever it is read.
+  await ensurePrivateFile(configPath);
 
   if (file) {
     logger.info('loaded config file', { path: configPath });
@@ -564,6 +567,7 @@ function buildListenersConfig(
     'opencode-log': { enabled: true, pollInterval: 30_000 },
     'pi-coding-agent-log': { enabled: true, pollInterval: 30_000 },
     workbuddy: { enabled: true, pollInterval: 30_000 },
+    'droid-transcript': { enabled: true, pollInterval: 30_000 },
     'hermes-agent-log': { enabled: true, pollInterval: 30_000 },
   };
 

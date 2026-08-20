@@ -26,6 +26,10 @@ export class MockFlusher extends BaseFlusher {
     this.batchCalls.push([...entries]);
   }
 
+  async sendBatchWithLocalDurableAck(entries: AgentActivityEntry[]): Promise<void> {
+    await this.sendBatch(entries);
+  }
+
   async flush(): Promise<void> {
     if (this.shouldFail) throw this.failureError;
     this.flushCount++;

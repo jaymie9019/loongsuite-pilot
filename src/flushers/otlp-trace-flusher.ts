@@ -26,8 +26,8 @@ import {
   type GlobalAttributesProvider,
 } from '../normalization/global-attributes.js';
 import { createLogger } from '../utils/logger.js';
-import { appendLine, ensureDir, getTodayDateString, readInstalledVersion } from '../utils/fs-utils.js';
-import { randomUUID } from 'node:crypto';
+import { appendLine, ensurePrivateDir, ensurePrivateFile, getTodayDateString, readInstalledVersion } from '../utils/fs-utils.js';
+import { createHash, randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import {
@@ -35,6 +35,7 @@ import {
   ReservedToolSpanIdGenerator,
   type ToolSpanIdReservations,
 } from './tool-span-id-reservation.js';
+import { DurableOtlpQueue, type DurableOtlpQueueStatus } from './durable-otlp-queue.js';
 
 const logger = createLogger('otlp-trace-flusher');
 
@@ -59,6 +60,25 @@ const SKILL_ATTRIBUTE_KEYS = [
   'loongsuite.skill.revision_source',
 ] as const;
 const BUILT_IN_SPAN_ATTRIBUTE_PASSTHROUGH_PREFIXES = ['loongsuite.skill.'] as const;
+const DROID_USAGE_DIAGNOSTIC_KEYS = [
+  'agent.droid.usage.completeness',
+  'agent.droid.turn.usage.input_tokens',
+  'agent.droid.turn.usage.output_tokens',
+  'agent.droid.turn.usage.total_tokens',
+  'agent.droid.turn.usage.cache_read_tokens',
+  'agent.droid.turn.usage.cache_creation_tokens',
+  'agent.droid.turn.usage.reasoning_tokens',
+  'agent.droid.session.usage.input_tokens',
+  'agent.droid.session.usage.output_tokens',
+  'agent.droid.session.usage.total_tokens',
+  'agent.droid.session.usage.cache_read_tokens',
+  'agent.droid.session.usage.cache_creation_tokens',
+  'agent.droid.session.usage.reasoning_tokens',
+] as const;
+const DROID_AGGREGATE_USAGE_PREFIXES = [
+  'agent.droid.turn.usage.',
+  'agent.droid.session.usage.',
+] as const;
 
 interface TurnBuffer {
   key: string;
@@ -95,6 +115,8 @@ export type OtlpExporterFactory = (opts: {
 
 interface ResolvedOtlpEndpoint {
   name: string;
+  durableRouteId: string;
+  durableEndpointIdentity: string;
   url: string;
   headers: Record<string, string>;
   compression: CompressionAlgorithm;
@@ -103,7 +125,30 @@ interface ResolvedOtlpEndpoint {
 }
 
 interface AgentExportState {
-  exporters: Array<{ name: string; exporter: TraceExporterLike }>;
+  exporters: Array<{ name: string; routeId: string; exporter: TraceExporterLike }>;
+}
+
+export interface OtlpLocalEnqueueAcceptance {
+  /** Every configured endpoint route whose complete set of batches was fsync-acked locally. */
+  acceptedRouteIds: string[];
+}
+
+export interface OtlpDurableRouteStatus extends DurableOtlpQueueStatus {
+  /** Stable public route identity; never contains headers or credential material. */
+  routeId: string;
+}
+
+export class OtlpLocalEnqueueError extends Error {
+  readonly code = 'OTLP_LOCAL_ENQUEUE_FAILED';
+
+  constructor(
+    message: string,
+    readonly acceptedRouteIds: string[],
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = 'OtlpLocalEnqueueError';
+  }
 }
 
 const RESERVED_RESOURCE_KEYS = new Set([
@@ -132,6 +177,25 @@ function resolveEndpointUrl(raw: string): string {
     url += '/v1/traces';
   }
   return url;
+}
+
+function routingIdentityHash(headers: Record<string, string>): string | undefined {
+  // These values choose a tenant/project but are not credentials. Auth/license
+  // headers are deliberately excluded so key rotation can resume the same
+  // queue without persisting a secret-derived verifier.
+  const routingKeys = new Set([
+    'x-arms-project',
+    'x-cms-workspace',
+    'x-project-id',
+    'x-scope-orgid',
+    'x-tenant-id',
+  ]);
+  const routingEntries = Object.entries(headers)
+    .map(([key, value]) => [key.toLowerCase(), value] as const)
+    .filter(([key]) => routingKeys.has(key))
+    .sort(([a], [b]) => a.localeCompare(b));
+  if (routingEntries.length === 0) return undefined;
+  return createHash('sha256').update(JSON.stringify(routingEntries)).digest('hex');
 }
 
 const defaultExporterFactory: OtlpExporterFactory = ({ url, headers, compression }) =>
@@ -174,6 +238,7 @@ export class OtlpTraceFlusher extends BaseFlusher {
   private readonly pilotVersion: string;
   private readonly endpoints: ResolvedOtlpEndpoint[];
   private readonly exporterFactory: OtlpExporterFactory;
+  private readonly durableExporters = new Map<string, DurableOtlpQueue>();
   private readonly debugDir: string;
   private readonly failedDir: string;
   private readonly resourceAttributeKeys: string[];
@@ -206,18 +271,71 @@ export class OtlpTraceFlusher extends BaseFlusher {
     this.cfg = cfg;
     this.globalAttributesProvider = globalAttributesProvider;
     this.exporterFactory = exporterFactory ?? defaultExporterFactory;
-    this.endpoints = cfg.endpoints.map((ep, i) => ({
-      name: ep.name || `otlp-${i}`,
-      url: resolveEndpointUrl(ep.endpoint),
-      headers: ep.headers ?? {},
-      compression: ep.compression === 'none' ? CompressionAlgorithm.NONE : CompressionAlgorithm.GZIP,
-      serviceName: ep.serviceName || cfg.serviceName,
-      appendAgentTypeToServiceName: cfg.appendAgentTypeToServiceName !== false,
-    }));
+    this.endpoints = cfg.endpoints.map((ep, i) => {
+      const name = ep.name || `otlp-${i}`;
+      const url = resolveEndpointUrl(ep.endpoint);
+      const headers = ep.headers ?? {};
+      const serviceName = ep.serviceName || cfg.serviceName;
+      const appendAgentTypeToServiceName = cfg.appendAgentTypeToServiceName !== false;
+      // This deliberately excludes the display name and auth credentials, so
+      // endpoint reorder/rename and key rotation resume the same queue. URL +
+      // service + non-secret tenant/project identity prevents cross-route replay.
+      const durableEndpointIdentity = JSON.stringify({
+        url,
+        serviceName,
+        appendAgentTypeToServiceName,
+        routingIdentityHash: routingIdentityHash(headers),
+      });
+      const identityHash = createHash('sha256').update(durableEndpointIdentity).digest('hex').slice(0, 24);
+      return {
+        name,
+        durableRouteId: `route-${identityHash}`,
+        durableEndpointIdentity,
+        url,
+        headers,
+        compression: ep.compression === 'none' ? CompressionAlgorithm.NONE : CompressionAlgorithm.GZIP,
+        serviceName,
+        appendAgentTypeToServiceName,
+      };
+    });
     const dataDir = cfg.dataDir ?? os.homedir() + '/.loongsuite-pilot';
     this.pilotVersion = readInstalledVersion(dataDir);
     this.debugDir = path.join(dataDir, 'logs', 'otlp-debug');
     this.failedDir = path.join(dataDir, 'logs', 'otlp-failed');
+    // Orchestrator always supplies dataDir. Keeping the legacy direct-export
+    // path when it is omitted preserves the lightweight constructor test seam
+    // and avoids an implicit write to the real home directory in embedders.
+    if (cfg.dataDir) {
+      const routeCounts = new Map<string, number>();
+      for (const endpoint of this.endpoints) {
+        routeCounts.set(endpoint.durableRouteId, (routeCounts.get(endpoint.durableRouteId) ?? 0) + 1);
+      }
+      for (const endpoint of this.endpoints) {
+        if ((routeCounts.get(endpoint.durableRouteId) ?? 0) > 1) {
+          // Two endpoints with the same public identity but different secret
+          // headers cannot be durably distinguished without persisting a
+          // credential-derived verifier. Stay on direct export rather than
+          // risk replaying a payload through the wrong credential/workspace.
+          logger.warn('durable OTLP queue disabled for ambiguous endpoint identity', {
+            endpoint: endpoint.name,
+          });
+          continue;
+        }
+        const underlying = this.exporterFactory({
+          url: endpoint.url,
+          headers: endpoint.headers,
+          compression: endpoint.compression,
+          name: endpoint.name,
+        });
+        this.durableExporters.set(endpoint.durableRouteId, new DurableOtlpQueue({
+          dataDir,
+          routeId: endpoint.durableRouteId,
+          endpointIdentity: endpoint.durableEndpointIdentity,
+          endpointName: endpoint.name,
+          exporter: underlying,
+        }));
+      }
+    }
     this.resourceAttributeKeys = (cfg.resourceAttributeKeys ?? [])
       .map(key => key.trim())
       .filter(key => key.length > 0);
@@ -351,6 +469,36 @@ export class OtlpTraceFlusher extends BaseFlusher {
     await this.flushCompleted();
   }
 
+  /**
+   * Replay-only AgentActivityEntry seam. The caller supplies one complete turn;
+   * this bypasses live turn buffering and resolves only after conversion plus
+   * durable local acceptance by every endpoint route.
+   */
+  async sendBatchStrict(entries: AgentActivityEntry[]): Promise<OtlpLocalEnqueueAcceptance> {
+    if (entries.length === 0) throw new Error('strict OTLP replay requires at least one event');
+    this.assertAllRoutesDurable();
+    const rawAgentTypes = entries.map(entry => String(entry['gen_ai.agent.type'] ?? '').trim());
+    if (rawAgentTypes.some(agentType => agentType.length === 0)) {
+      throw new Error('strict OTLP replay batch is missing gen_ai.agent.type');
+    }
+    const agentTypes = [...new Set(rawAgentTypes.map(normalizeAgentType))];
+    if (agentTypes.length !== 1) {
+      throw new Error('strict OTLP replay batch must contain exactly one agent type');
+    }
+
+    const acceptedRouteIds = await this.convertAndExport(agentTypes[0], entries, true);
+    return { acceptedRouteIds };
+  }
+
+  /**
+   * Durable-participant seam for source checkpoint acknowledgement. Resolution
+   * means every configured OTLP route has fsync-accepted this complete batch;
+   * it does not mean the remote collector has acknowledged delivery.
+   */
+  async sendBatchWithLocalDurableAck(entries: AgentActivityEntry[]): Promise<void> {
+    await this.sendBatchStrict(entries);
+  }
+
   async flush(): Promise<void> {
     for (const buf of this.turnBuffers.values()) {
       buf.completed = true;
@@ -359,6 +507,20 @@ export class OtlpTraceFlusher extends BaseFlusher {
     while (this.inFlightExports.size > 0) {
       const batch = [...this.inFlightExports];
       await Promise.allSettled(batch);
+    }
+    // Preserve the pre-durable flush contract: once conversion/local enqueue
+    // has completed, give every queue's current delivery pass a chance to
+    // finish before shutdown can close it. waitForIdle deliberately returns on
+    // retry backoff or 401/403 pause, so an unavailable backend cannot block
+    // flush forever. Queue I/O failures stay fail-isolated but are explicit.
+    const durableWaits = await Promise.allSettled(
+      [...this.durableExporters.values()].map(queue => queue.waitForIdle()),
+    );
+    const durableWaitFailures = durableWaits.filter(result => result.status === 'rejected');
+    if (durableWaitFailures.length > 0) {
+      logger.error('durable OTLP flush could not reach current-drain idle', {
+        failedRoutes: durableWaitFailures.length,
+      });
     }
     this.flushedTurnKeys.clear();
   }
@@ -371,15 +533,18 @@ export class OtlpTraceFlusher extends BaseFlusher {
 
     await this.flush();
 
-    const exportShutdowns = [...this.agentExportStates.values()].flatMap(
-      (s) => s.exporters.map((e) => e.exporter.shutdown()),
-    );
+    const uniqueExporters = new Set<TraceExporterLike>([
+      ...this.durableExporters.values(),
+      ...[...this.agentExportStates.values()].flatMap((s) => s.exporters.map((e) => e.exporter)),
+    ]);
+    const exportShutdowns = [...uniqueExporters].map((exporter) => exporter.shutdown());
     const providerShutdowns = [...this.agentConvertStates.values()].map(
       (s) => s.provider.shutdown(),
     );
     await Promise.allSettled([...exportShutdowns, ...providerShutdowns]);
 
     this.agentExportStates.clear();
+    this.durableExporters.clear();
     this.agentConvertStates.clear();
     logger.info('OTLP trace flusher shut down');
   }
@@ -400,6 +565,49 @@ export class OtlpTraceFlusher extends BaseFlusher {
         this.exportInBatches(this.getOrCreateExportState(agentType, serviceName), agentType, spans),
       ),
     );
+  }
+
+  /**
+   * Strict replay seam. Resolution means every configured route has atomically
+   * persisted every batch; it is deliberately not a remote AgentLoop ack.
+   * Callers must write replay ledgers only after this promise resolves.
+   */
+  async enqueueSpansForAgent(
+    agentType: string,
+    spans: ReadableSpan[],
+  ): Promise<OtlpLocalEnqueueAcceptance> {
+    if (spans.length === 0) throw new Error('strict OTLP enqueue requires at least one span');
+    this.assertAllRoutesDurable();
+    if (this.cfg.debug) await this.writeDebugLog(agentType, spans);
+
+    const serviceNames = [...new Set(
+      this.endpoints.map((endpoint) => this.resolveEndpointServiceName(endpoint, agentType)),
+    )];
+    const acceptedRouteIds = await this.awaitStrictLocalAcceptances(
+      serviceNames.map((serviceName) => this.exportInBatches(
+        this.getOrCreateExportState(agentType, serviceName),
+        agentType,
+        spans,
+        true,
+      )),
+    );
+    return { acceptedRouteIds };
+  }
+
+  /** Redacted inventory for replay/control-plane callers. */
+  async inspectDurableQueues(): Promise<OtlpDurableRouteStatus[]> {
+    this.assertAllRoutesDurable();
+    return this.collectDurableQueueStatuses(queue => queue.inspect());
+  }
+
+  /**
+   * Clears route pause/backoff state, runs one immediate pass per configured
+   * route, and returns the post-pass local inventory. Resolution is not a
+   * guarantee that pendingItems reached zero.
+   */
+  async replayDurableQueues(): Promise<OtlpDurableRouteStatus[]> {
+    this.assertAllRoutesDurable();
+    return this.collectDurableQueueStatuses(queue => queue.replayNow());
   }
 
   // --- Internal ---
@@ -492,8 +700,9 @@ export class OtlpTraceFlusher extends BaseFlusher {
   private async convertAndExport(
     agentType: string,
     records: AgentActivityEntry[],
-  ): Promise<void> {
-    if (records.length === 0) return;
+    strictLocalAck = false,
+  ): Promise<string[]> {
+    if (records.length === 0) return [];
     const projectedResourceAttributes = this.collectResourceAttributes(records);
     const resourceIdentity = this.resolveAgentResourceIdentity(agentType, records);
     // Convert once per distinct service.name (backends may split into user/inner
@@ -502,22 +711,29 @@ export class OtlpTraceFlusher extends BaseFlusher {
     const serviceNames = [...new Set(
       this.endpoints.map((endpoint) => this.resolveEndpointServiceName(endpoint, agentType)),
     )];
-    await Promise.all(
-      serviceNames.map((serviceName) => {
+    const serviceOperations =
+      serviceNames.map(async (serviceName) => {
         const convertKey = this.buildConvertStateKey(agentType, serviceName, projectedResourceAttributes);
         const prev = this.convertLocks.get(convertKey) ?? Promise.resolve();
-        const current = prev.then(() => this.doConvertAndExport(
-          agentType,
-          serviceName,
-          records,
-          projectedResourceAttributes,
-          resourceIdentity,
-          convertKey,
-        ));
-        this.convertLocks.set(convertKey, current.catch(() => {}));
-        return current;
-      }),
-    );
+        let acceptedForService: string[] = [];
+        const current = prev.then(async () => {
+          acceptedForService = await this.doConvertAndExport(
+            agentType,
+            serviceName,
+            records,
+            projectedResourceAttributes,
+            resourceIdentity,
+            convertKey,
+            strictLocalAck,
+          );
+        });
+        this.convertLocks.set(convertKey, current.catch(() => undefined));
+        await current;
+        return acceptedForService;
+      });
+    if (strictLocalAck) return this.awaitStrictLocalAcceptances(serviceOperations);
+    const accepted = await Promise.all(serviceOperations);
+    return [...new Set(accepted.flat())].sort();
   }
 
   private async doConvertAndExport(
@@ -527,7 +743,8 @@ export class OtlpTraceFlusher extends BaseFlusher {
     projectedResourceAttributes: Record<string, ResourceProjectionValue>,
     resourceIdentity: AgentResourceIdentity,
     convertKey: string,
-  ): Promise<void> {
+    strictLocalAck: boolean,
+  ): Promise<string[]> {
     const convertState = this.getOrCreateConvertState(
       agentType,
       serviceName,
@@ -599,24 +816,30 @@ export class OtlpTraceFlusher extends BaseFlusher {
           logger.warn(`Conversion warnings for ${agentType}`, { warnings: result.warnings.join('; ') });
         }
       } catch (err) {
-        logger.error(`convertEventLogToTrace failed for ${agentType}`, { err: String(err) });
-        // Reset the shared in-memory exporter even on conversion failure: a
-        // partial run may have already pushed spans into it via the handler,
-        // and leaving them would pollute the next call's getFinishedSpans()
-        // snapshot — leaking spans across turns and ultimately producing
-        // duplicate span IDs that ARMS rejects, which looks like "OTLP trace
-        // not exported, pollutes subsequent sessions". Resetting here keeps
-        // each convert attempt's span set isolated.
+        // A converter can end some spans before throwing. Never let those
+        // partial spans leak into the next strict replay attempt.
         inMem.reset();
-        return;
+        logger.error(`convertEventLogToTrace failed for ${agentType}`, { err: String(err) });
+        if (strictLocalAck) throw err;
+        return [];
       }
 
-      await provider.forceFlush();
-      const spans = inMem.getFinishedSpans();
-      inMem.reset();
+      let spans: ReadableSpan[];
+      try {
+        await provider.forceFlush();
+        spans = inMem.getFinishedSpans();
+      } finally {
+        inMem.reset();
+      }
 
-      if (spans.length === 0) return;
+      if (spans.length === 0) {
+        if (strictLocalAck) throw new Error('strict OTLP replay produced no exportable spans');
+        return [];
+      }
       this.enrichToolSkillAttributes(records, spans);
+      if (agentType === 'droid') {
+        this.enrichDroidUsageDiagnostics(records, spans);
+      }
       if (agentType === 'openclaw') {
         this.enrichOpenClawToolAttributes(records, spans);
         this.enrichOpenClawLlmAttributes(records, spans);
@@ -628,9 +851,11 @@ export class OtlpTraceFlusher extends BaseFlusher {
         await this.writeDebugLog(agentType, spans);
       }
 
-      await this.exportInBatches(exportState, agentType, spans);
+      return await this.exportInBatches(exportState, agentType, spans, strictLocalAck);
     } catch (err) {
+      if (strictLocalAck) throw err;
       logger.error(`convert and export failed for ${agentType}`, { err: String(err) });
+      return [];
     } finally {
       convertState.active -= 1;
       this.evictConvertStates();
@@ -641,7 +866,8 @@ export class OtlpTraceFlusher extends BaseFlusher {
     exportState: AgentExportState,
     agentType: string,
     spans: ReadableSpan[],
-  ): Promise<void> {
+    strictLocalAck = false,
+  ): Promise<string[]> {
     const maxBytes = this.cfg.maxExportBatchBytes ?? DEFAULT_MAX_EXPORT_BATCH_BYTES;
     const batches: ReadableSpan[][] = [];
     let current: ReadableSpan[] = [];
@@ -666,11 +892,83 @@ export class OtlpTraceFlusher extends BaseFlusher {
     // Fan out per-endpoint in parallel: each backend drains its own batches
     // sequentially, but backends run concurrently — so a slow/hung backend
     // only delays itself, not the healthy ones (no head-of-line blocking).
-    await Promise.allSettled(
-      exportState.exporters.map(({ name, exporter }) =>
-        this.exportBatchesToEndpoint(exporter, name, agentType, batches),
-      ),
+    const results = await Promise.allSettled(
+      exportState.exporters.map(async ({ name, routeId, exporter }) => {
+        await this.exportBatchesToEndpoint(exporter, name, agentType, batches);
+        return routeId;
+      }),
     );
+    const acceptedRouteIds = results.flatMap(result =>
+      result.status === 'fulfilled' ? [result.value] : [],
+    );
+    if (strictLocalAck) {
+      const failures = results.flatMap(result =>
+        result.status === 'rejected' ? [result.reason] : [],
+      );
+      if (failures.length > 0) {
+        throw new OtlpLocalEnqueueError(
+          `durable OTLP enqueue failed for ${failures.length} route(s)`,
+          acceptedRouteIds,
+          { cause: new AggregateError(failures) },
+        );
+      }
+    }
+    return acceptedRouteIds;
+  }
+
+  private assertAllRoutesDurable(): void {
+    const missing = this.endpoints
+      .filter(endpoint => !this.durableExporters.has(endpoint.durableRouteId))
+      .map(endpoint => endpoint.durableRouteId);
+    if (missing.length > 0) {
+      throw new OtlpLocalEnqueueError(
+        'strict OTLP enqueue requires an unambiguous durable route for every endpoint',
+        [],
+        { cause: new Error(`non-durable routes: ${missing.join(', ')}`) },
+      );
+    }
+  }
+
+  private async collectDurableQueueStatuses(
+    operation: (queue: DurableOtlpQueue) => Promise<DurableOtlpQueueStatus>,
+  ): Promise<OtlpDurableRouteStatus[]> {
+    const uniqueRoutes = [...new Set(this.endpoints.map(endpoint => endpoint.durableRouteId))].sort();
+    return Promise.all(uniqueRoutes.map(async (routeId) => {
+      const queue = this.durableExporters.get(routeId);
+      if (!queue) {
+        // assertAllRoutesDurable already checked this; retain a local guard so a
+        // future refactor cannot turn a missing route into a partial success.
+        throw new OtlpLocalEnqueueError('configured durable OTLP route is unavailable', []);
+      }
+      return { routeId, ...await operation(queue) };
+    }));
+  }
+
+  private async awaitStrictLocalAcceptances(
+    operations: Array<Promise<string[]>>,
+  ): Promise<string[]> {
+    const results = await Promise.allSettled(operations);
+    const acceptedRouteIds = new Set<string>();
+    const failures: unknown[] = [];
+    for (const result of results) {
+      if (result.status === 'fulfilled') {
+        for (const routeId of result.value) acceptedRouteIds.add(routeId);
+        continue;
+      }
+      failures.push(result.reason);
+      if (result.reason instanceof OtlpLocalEnqueueError) {
+        for (const routeId of result.reason.acceptedRouteIds) acceptedRouteIds.add(routeId);
+      }
+    }
+    const accepted = [...acceptedRouteIds].sort();
+    if (failures.length > 0) {
+      throw new OtlpLocalEnqueueError(
+        `durable OTLP enqueue failed for ${failures.length} service group(s)`,
+        accepted,
+        { cause: new AggregateError(failures) },
+      );
+    }
+    return accepted;
   }
 
   private async exportBatchesToEndpoint(
@@ -679,8 +977,18 @@ export class OtlpTraceFlusher extends BaseFlusher {
     agentType: string,
     batches: ReadableSpan[][],
   ): Promise<void> {
+    const failures: unknown[] = [];
     for (const batch of batches) {
-      await this.doExport(exporter, endpointName, agentType, batch);
+      try {
+        await this.doExport(exporter, endpointName, agentType, batch);
+      } catch (err) {
+        // One failed batch must not prevent the remaining batches from getting a
+        // chance to enter the durable queue. Strict callers receive the aggregate.
+        failures.push(err);
+      }
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(failures, `OTLP enqueue failed for endpoint ${endpointName}`);
     }
   }
 
@@ -690,19 +998,47 @@ export class OtlpTraceFlusher extends BaseFlusher {
     agentType: string,
     spans: ReadableSpan[],
   ): Promise<void> {
-    // Never rejects: a failing backend is isolated + persisted, not propagated.
-    return new Promise<void>((resolve) => {
-      exporter.export(spans, (result) => {
-        if (result.code !== ExportResultCode.SUCCESS) {
-          const errMsg = result.error?.message ?? 'unknown export error';
-          logger.warn(`Export failed for ${agentType} → ${endpointName}: ${errMsg}`);
+    // A SUCCESS from DurableOtlpQueue is the local fsync ack. Direct-export
+    // failures still reject internally, but the live path isolates them via
+    // exportInBatches(..., false).
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const callback = (result: ExportResult): void => {
+        if (settled) return;
+        settled = true;
+        if (result.code === ExportResultCode.SUCCESS) {
+          resolve();
+          return;
+        }
+        const errMsg = result.error?.message ?? 'unknown export error';
+        logger.warn(`Export failed for ${agentType} → ${endpointName}: ${errMsg}`);
+        if (exporter instanceof DurableOtlpQueue) {
+          // A DurableOtlpQueue failure means even the bounded, fsync-backed
+          // local acceptance failed (for example init, capacity, or disk I/O).
+          // The live pipeline remains fail-isolated, but must not silently
+          // switch to the legacy append-only JSONL sink: that sink is
+          // incomplete, unbounded, and cannot be replayed losslessly.
+          logger.error('durable OTLP local acceptance failed; live batch remains unacknowledged', {
+            endpoint: endpointName,
+            agentType,
+            errorType: result.error?.constructor?.name ?? 'Error',
+            legacyFallback: false,
+          });
+        } else {
           this.writeFailedLog(agentType, endpointName, spans, {
             code: result.code,
             message: errMsg,
           }).catch(() => undefined);
         }
-        resolve();
-      });
+        reject(result.error ?? new Error(errMsg));
+      };
+      try {
+        exporter.export(spans, callback);
+      } catch (err) {
+        if (settled) return;
+        settled = true;
+        reject(err);
+      }
     });
   }
 
@@ -732,7 +1068,7 @@ export class OtlpTraceFlusher extends BaseFlusher {
       spanProcessors: [new SimpleSpanProcessor(inMem)],
     });
     const handler = new ExtendedTelemetryHandler({ tracerProvider: provider });
-    const toolSpanIds = attachReservedToolSpanIds(handler, idGenerator);
+    const toolSpanIds = attachReservedToolSpanIds(handler, idGenerator, agentType === 'droid');
 
     state = { provider, handler, inMem, toolSpanIds, active: 0 };
     this.agentConvertStates.set(key, state);
@@ -764,6 +1100,67 @@ export class OtlpTraceFlusher extends BaseFlusher {
       if (typeof callId !== 'string') continue;
       const attributes = attributesByCallId.get(callId);
       if (attributes) Object.assign(span.attributes, attributes);
+    }
+  }
+
+  /**
+   * The event-log converter only maps standard per-call gen_ai.usage fields.
+   * Droid deliberately keeps settings-only totals in a namespaced aggregate
+   * because assigning them to an individual model call would be false
+   * precision. Preserve those diagnostics on the source LLM and its AGENT
+   * summary without manufacturing standard token usage.
+   */
+  private enrichDroidUsageDiagnostics(
+    records: AgentActivityEntry[],
+    spans: ReadableSpan[],
+  ): void {
+    type DiagnosticValue = string | number | boolean;
+    const responseDiagnostics = new Map<string, Record<string, DiagnosticValue>>();
+    let agentDiagnostics: Record<string, DiagnosticValue> | undefined;
+    const completenessValues: string[] = [];
+
+    for (const record of records) {
+      if (record['event.name'] !== 'llm.response') continue;
+      const diagnostics: Record<string, DiagnosticValue> = {};
+      for (const key of DROID_USAGE_DIAGNOSTIC_KEYS) {
+        const value = record[key];
+        if (typeof value === 'string' || typeof value === 'boolean'
+          || (typeof value === 'number' && Number.isFinite(value))) {
+          diagnostics[key] = value;
+        }
+      }
+      const completeness = diagnostics['agent.droid.usage.completeness'];
+      if (typeof completeness === 'string') completenessValues.push(completeness);
+
+      const responseId = record['gen_ai.response.id'];
+      if (typeof responseId === 'string' && responseId.length > 0
+        && Object.keys(diagnostics).length > 0) {
+        responseDiagnostics.set(responseId, diagnostics);
+      }
+      if (DROID_USAGE_DIAGNOSTIC_KEYS.some(key =>
+        DROID_AGGREGATE_USAGE_PREFIXES.some(prefix => key.startsWith(prefix))
+        && diagnostics[key] !== undefined)) {
+        agentDiagnostics = diagnostics;
+      }
+    }
+
+    if (!agentDiagnostics && completenessValues.length > 0
+      && completenessValues.every(value => value === completenessValues[0])) {
+      agentDiagnostics = {
+        'agent.droid.usage.completeness': completenessValues[0],
+      };
+    }
+
+    for (const span of spans) {
+      const kind = span.attributes['gen_ai.span.kind'];
+      if (kind === 'LLM') {
+        const responseId = span.attributes['gen_ai.response.id'];
+        if (typeof responseId !== 'string') continue;
+        const diagnostics = responseDiagnostics.get(responseId);
+        if (diagnostics) Object.assign(span.attributes, diagnostics);
+      } else if (kind === 'AGENT' && agentDiagnostics) {
+        Object.assign(span.attributes, agentDiagnostics);
+      }
     }
   }
 
@@ -999,7 +1396,8 @@ export class OtlpTraceFlusher extends BaseFlusher {
       .filter((endpoint) => this.resolveEndpointServiceName(endpoint, agentType) === serviceName)
       .map((ep) => ({
         name: ep.name,
-        exporter: this.exporterFactory({
+        routeId: ep.durableRouteId,
+        exporter: this.durableExporters.get(ep.durableRouteId) ?? this.exporterFactory({
           url: ep.url,
           headers: ep.headers,
           compression: ep.compression,
@@ -1076,13 +1474,14 @@ export class OtlpTraceFlusher extends BaseFlusher {
     try {
       const svcName = `${this.cfg.serviceName}-${agentType}`;
       const dir = this.debugDir;
-      await ensureDir(dir);
+      await ensurePrivateDir(dir);
       const filename = `${svcName}-${getTodayDateString()}.jsonl`;
       const filepath = path.join(dir, filename);
       const jsonLines = createReadableSpanToOtlpSpanJsonArray(spans);
       for (const line of jsonLines) {
         await appendLine(filepath, line);
       }
+      await ensurePrivateFile(filepath);
     } catch (err) {
       logger.warn('Debug log write failed (non-blocking)', { err: String(err) });
     }
@@ -1100,7 +1499,7 @@ export class OtlpTraceFlusher extends BaseFlusher {
       const safeEndpoint = endpointName.replace(/[^A-Za-z0-9._-]/g, '_');
       const svcName = `${this.cfg.serviceName}-${agentType}__${safeEndpoint}`;
       const dir = this.failedDir;
-      await ensureDir(dir);
+      await ensurePrivateDir(dir);
       const filepath = path.join(dir, `${svcName}.jsonl`);
       const jsonLines = createReadableSpanToOtlpSpanJsonArray(spans);
       for (const line of jsonLines) {
@@ -1108,6 +1507,7 @@ export class OtlpTraceFlusher extends BaseFlusher {
         obj._error = error;
         await appendLine(filepath, JSON.stringify(obj));
       }
+      await ensurePrivateFile(filepath);
     } catch (err) {
       logger.warn('Failed-log write failed', { err: String(err) });
     }

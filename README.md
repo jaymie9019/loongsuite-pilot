@@ -47,6 +47,7 @@ Pilot is designed to answer practical questions:
 | Cursor        | Hook                      | Yes          | Yes        | Yes         | Yes                       |
 | Cursor CLI    | Shared Cursor hook        | Yes          | Yes        | Yes         | Yes                       |
 | DeepSeek Harness | YAML patch plugin + local JSONL polling | Yes | Yes | Yes | Yes |
+| Factory Droid | Hook wakeup + local transcript/settings/log polling | Yes | Yes | Conditional | Yes |
 | Hermes Agent  | Native directory plugin   | Yes          | Yes        | Yes         | Yes                       |
 | Kiro CLI      | Hook / session polling    | Yes          | Yes        | No          | Yes                       |
 | MiMo Code     | Plugin injection          | Yes          | Yes        | Yes         | Yes                       |
@@ -69,6 +70,33 @@ DeepSeek Harness (`dsh`) loads Pilot's observability plugin from its user-level
 `cordis.patch.yml`. The integration captures native LLM, reasoning, tool, token,
 and time-to-first-token events. See [Agent Configuration](docs/agents.md#deepseek-harness-collection-and-lifecycle)
 for activation, source-log, disable, and uninstall behavior.
+
+Factory Droid collection supports transcript schema v2. The transcript is the
+conversation and tool-activity source of truth, session settings provide
+aggregate usage fallback, and explicitly allowlisted Droid `0.199.0` and
+`0.200.0` logs optionally add exact per-call usage and timing. Hooks are
+structural wakeup hints only and installation preserves unrelated user hooks.
+Pilot does not use Droid's native OTLP output as this integration's primary
+data path.
+
+Droid content always passes Pilot's complete `mode=all` mask plan before
+output. Historical replay is currently inspection-only via
+`loongsuite-pilot droid replay --session-id <ID> --dry-run`. Exact historical
+per-call tokens are available only while the matching Droid log records remain.
+
+AgentLoop does not deduplicate replayed spans by matching trace/span IDs, and
+the current replay path has no shared live/replay outbox/receipt. Therefore
+`droid replay --execute` is temporarily disabled and exits 1 before source or
+queue access. Dry-run retains the strict eligibility summary:
+`liveProcessedSkipped` covers transcripts handled by live collection, while
+missing, incomplete, pending, or changed baseline receipts appear under
+`unsafeStateSkipped`. See
+[Agent Configuration](docs/agents.md#factory-droid-collection-and-replay) for
+the trust and replay boundaries.
+
+Use `loongsuite-pilot failed replay --dry-run` to inspect the durable queue and
+`--execute` to request an immediate delivery pass. Legacy `logs/otlp-failed`
+files are inventoried only because they cannot be reconstructed losslessly.
 
 ### Documented Windows Agent Support
 
