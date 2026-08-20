@@ -126,9 +126,13 @@ async function doctorCommand(dataDir: string, argv: string[]): Promise<void> {
   console.log(`Agent dir: ${result.agentDir}`);
   console.log(`Detected:  ${yesNo(result.detected)}`);
   console.log(`Runtime:   ${yesNo(result.runtimePresent)}`);
+  console.log(`Runtime loadable: ${yesNo(result.runtimeLoadable)}`);
+  console.log(`Runtime API: ${result.runtimeApiVersion ?? '-'}`);
   console.log(`Wrapper:   ${yesNo(result.wrapperPresent)}`);
+  console.log(`Wrapper loadable: ${yesNo(result.wrapperLoadable)}`);
   console.log(`Injected:  ${yesNo(result.injectionPresent)}`);
   console.log(`Healthy:   ${yesNo(result.healthy)}`);
+  if (result.contractError) console.log(`Contract:  ${result.contractError}`);
 }
 
 async function unregisterCommand(dataDir: string, argv: string[]): Promise<void> {

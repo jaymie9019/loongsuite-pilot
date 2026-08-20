@@ -1,5 +1,6 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import type { AgentDefinition } from '../types/index.js';
 import { detectAgent } from '../deployment/detect-utils.js';
 import { PluginInjectStrategy } from '../deployment/plugin-inject-strategy.js';
@@ -26,6 +27,7 @@ export { validatePiSdkAgentId } from './pi-sdk-agent-identity.js';
 const PI_SDK_INPUT_TYPE = 'pi-sdk-jsonl';
 const PI_SDK_REGISTRY_LOCK_FILE = 'pi-sdk-registry.lock';
 const PI_SDK_WRAPPER_RETRY_DELAYS_MS = [100, 300] as const;
+export const PI_TELEMETRY_PLUGIN_API_VERSION = 1;
 
 export const PI_SDK_REGISTRY_PROCESS_PATTERNS: readonly ProcessCommandPattern[] = [
   ...COLLECTOR_PROCESS_PATTERNS,
@@ -75,8 +77,20 @@ export interface PiSdkAgentDoctorResult {
   detected: boolean;
   wrapperPresent: boolean;
   runtimePresent: boolean;
+  runtimeLoadable: boolean;
+  wrapperLoadable: boolean;
+  runtimeApiVersion?: number;
+  contractError?: string;
   injectionPresent: boolean;
   healthy: boolean;
+}
+
+export interface PiRuntimeContractValidationResult {
+  runtimePath: string;
+  runtimePresent: boolean;
+  runtimeLoadable: boolean;
+  runtimeApiVersion?: number;
+  contractError?: string;
 }
 
 export function buildPiSdkAgentDefinition(
@@ -158,6 +172,10 @@ async function registerPiSdkAgentLocked(
   const missingRuntimeAssets = await findMissingRuntimeAssets(dataDir);
   if (missingRuntimeAssets.length > 0) {
     throw new Error(`Pilot PI extension runtime is missing; reinstall or repair Pilot: ${missingRuntimeAssets.join(', ')}`);
+  }
+  const runtimeContract = await validatePiRuntimeContract(dataDir);
+  if (!runtimeContract.runtimeLoadable) {
+    throw new Error(`Pilot PI extension runtime contract is incompatible: ${runtimeContract.contractError}`);
   }
 
   let previousWrapper: string | null = null;
@@ -284,6 +302,10 @@ async function ensureRegisteredPiSdkWrappersLocked(dataDir: string): Promise<num
   if (missingRuntimeAssets.length > 0) {
     throw new Error(`Pilot PI extension runtime is missing; reinstall or repair Pilot: ${missingRuntimeAssets.join(', ')}`);
   }
+  const runtimeContract = await validatePiRuntimeContract(dataDir);
+  if (!runtimeContract.runtimeLoadable) {
+    throw new Error(`Pilot PI extension runtime contract is incompatible: ${runtimeContract.contractError}`);
+  }
 
   let restored = 0;
   for (const definition of definitions) {
@@ -357,14 +379,20 @@ export async function doctorPiSdkAgent(
   }
 
   const strategy = new PluginInjectStrategy(dataDir, dataDir);
-  const [detected, wrapperPresent, missingRuntimeAssets, needsDeploy] = await Promise.all([
+  const wrapperPath = getWrapperPath(dataDir, id);
+  const [detected, wrapperPresent, missingRuntimeAssets, needsDeploy, runtimeContract] = await Promise.all([
     detectAgent(definition.detection),
-    fileExists(getWrapperPath(dataDir, id)),
+    fileExists(wrapperPath),
     findMissingRuntimeAssets(dataDir),
     strategy.needsDeploy(definition),
+    validatePiRuntimeContract(dataDir),
   ]);
   const runtimePresent = missingRuntimeAssets.length === 0;
   const injectionPresent = !needsDeploy;
+  const wrapperContract = wrapperPresent
+    ? await validatePiWrapperContract(wrapperPath)
+    : { wrapperLoadable: false, contractError: 'generated wrapper is missing' };
+  const contractError = runtimeContract.contractError ?? wrapperContract.contractError;
 
   return {
     id,
@@ -373,9 +401,103 @@ export async function doctorPiSdkAgent(
     detected,
     wrapperPresent,
     runtimePresent,
+    runtimeLoadable: runtimeContract.runtimeLoadable,
+    wrapperLoadable: wrapperContract.wrapperLoadable,
+    runtimeApiVersion: runtimeContract.runtimeApiVersion,
+    ...(contractError ? { contractError } : {}),
     injectionPresent,
-    healthy: detected && runtimePresent && wrapperPresent && injectionPresent,
+    healthy: detected
+      && runtimePresent
+      && wrapperPresent
+      && runtimeContract.runtimeLoadable
+      && wrapperContract.wrapperLoadable
+      && injectionPresent,
   };
+}
+
+export async function validatePiRuntimeContract(
+  dataDirValue: string,
+): Promise<PiRuntimeContractValidationResult> {
+  const dataDir = resolveAbsolutePath(dataDirValue, 'Pilot data directory');
+  const runtimePath = path.join(dataDir, 'plugins', 'pi-coding-agent', 'index.mjs');
+  if (!await fileExists(runtimePath)) {
+    return {
+      runtimePath,
+      runtimePresent: false,
+      runtimeLoadable: false,
+      contractError: 'PI extension runtime is missing',
+    };
+  }
+
+  try {
+    const runtime = await importFresh(runtimePath);
+    const runtimeApiVersion = typeof runtime.PI_TELEMETRY_PLUGIN_API_VERSION === 'number'
+      ? runtime.PI_TELEMETRY_PLUGIN_API_VERSION
+      : undefined;
+    if (typeof runtime.createPiTelemetryExtension !== 'function') {
+      return {
+        runtimePath,
+        runtimePresent: true,
+        runtimeLoadable: false,
+        runtimeApiVersion,
+        contractError: 'runtime does not export createPiTelemetryExtension',
+      };
+    }
+    if (runtimeApiVersion !== PI_TELEMETRY_PLUGIN_API_VERSION) {
+      return {
+        runtimePath,
+        runtimePresent: true,
+        runtimeLoadable: false,
+        runtimeApiVersion,
+        contractError: `runtime API version ${runtimeApiVersion ?? 'missing'} does not match expected ${PI_TELEMETRY_PLUGIN_API_VERSION}`,
+      };
+    }
+    return {
+      runtimePath,
+      runtimePresent: true,
+      runtimeLoadable: true,
+      runtimeApiVersion,
+    };
+  } catch (err) {
+    return {
+      runtimePath,
+      runtimePresent: true,
+      runtimeLoadable: false,
+      contractError: `runtime import failed: ${formatContractError(err)}`,
+    };
+  }
+}
+
+async function validatePiWrapperContract(wrapperPath: string): Promise<{
+  wrapperLoadable: boolean;
+  contractError?: string;
+}> {
+  try {
+    const wrapper = await importFresh(wrapperPath);
+    if (typeof wrapper.default !== 'function') {
+      return {
+        wrapperLoadable: false,
+        contractError: 'generated wrapper does not export a default extension function',
+      };
+    }
+    return { wrapperLoadable: true };
+  } catch (err) {
+    return {
+      wrapperLoadable: false,
+      contractError: `generated wrapper import failed: ${formatContractError(err)}`,
+    };
+  }
+}
+
+async function importFresh(modulePath: string): Promise<Record<string, unknown>> {
+  const url = pathToFileURL(modulePath);
+  url.searchParams.set('pilot_contract_probe', `${Date.now()}-${process.hrtime.bigint()}`);
+  return import(url.href) as Promise<Record<string, unknown>>;
+}
+
+function formatContractError(error: unknown): string {
+  if (error instanceof Error) return `${error.name}: ${error.message}`;
+  return String(error);
 }
 
 export function isPiSdkAgentDefinition(definition: AgentDefinition): definition is AgentDefinition & {
