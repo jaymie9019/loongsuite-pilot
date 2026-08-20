@@ -19,6 +19,7 @@ import {
 } from '../shared/resource-context.mjs';
 
 const LOG_PREFIX = 'pi-coding-agent';
+export const PI_TELEMETRY_PLUGIN_API_VERSION = 1;
 const DEFAULT_IDENTITY = Object.freeze({
   agentType: 'pi-coding-agent',
   agentId: 'pi-coding-agent',

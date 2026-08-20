@@ -88,7 +88,10 @@ describe('PI SDK Agent registry', () => {
     await expect(doctorPiSdkAgent(dataDir, 'acme-code')).resolves.toMatchObject({
       detected: true,
       runtimePresent: true,
+      runtimeLoadable: true,
+      runtimeApiVersion: 1,
       wrapperPresent: true,
+      wrapperLoadable: true,
       injectionPresent: true,
       healthy: true,
     });
@@ -300,6 +303,77 @@ describe('PI SDK Agent registry', () => {
       detectionPaths: [detectionPath],
     })).rejects.toThrow('runtime is missing');
     await expect(fs.access(path.join(agentDir, 'settings.json'))).rejects.toThrow();
+  });
+
+  it('rejects a present runtime that does not export the named factory', async () => {
+    await fs.writeFile(
+      path.join(dataDir, 'plugins', 'pi-coding-agent', 'index.mjs'),
+      'export const PI_TELEMETRY_PLUGIN_API_VERSION = 1;\nexport default function extension() {}\n',
+    );
+
+    await expect(registerPiSdkAgent({
+      dataDir,
+      id: 'acme-code',
+      name: 'Acme',
+      agentDir,
+      detectionPaths: [detectionPath],
+    })).rejects.toThrow('does not export createPiTelemetryExtension');
+    await expect(fs.access(path.join(agentDir, 'settings.json'))).rejects.toThrow();
+    await expect(fs.access(path.join(dataDir, 'plugins', 'pi-coding-agent', 'agents', 'acme-code.mjs')))
+      .rejects.toThrow();
+  });
+
+  it('rejects a runtime with an incompatible plugin API version', async () => {
+    await fs.writeFile(
+      path.join(dataDir, 'plugins', 'pi-coding-agent', 'index.mjs'),
+      [
+        'export const PI_TELEMETRY_PLUGIN_API_VERSION = 999;',
+        'export function createPiTelemetryExtension() { return function extension() {}; }',
+        '',
+      ].join('\n'),
+    );
+
+    await expect(registerPiSdkAgent({
+      dataDir,
+      id: 'acme-code',
+      name: 'Acme',
+      agentDir,
+      detectionPaths: [detectionPath],
+    })).rejects.toThrow('runtime API version 999 does not match expected 1');
+    await expect(fs.access(path.join(agentDir, 'settings.json'))).rejects.toThrow();
+  });
+
+  it('reports runtime and wrapper import failures through doctor', async () => {
+    const result = await registerPiSdkAgent({
+      dataDir,
+      id: 'acme-code',
+      name: 'Acme',
+      agentDir,
+      detectionPaths: [detectionPath],
+    });
+
+    await fs.writeFile(result.wrapperPath, 'throw new Error("wrapper exploded");\n');
+    await expect(doctorPiSdkAgent(dataDir, 'acme-code')).resolves.toMatchObject({
+      runtimePresent: true,
+      runtimeLoadable: true,
+      wrapperPresent: true,
+      wrapperLoadable: false,
+      healthy: false,
+      contractError: expect.stringContaining('wrapper exploded'),
+    });
+
+    await fs.writeFile(
+      path.join(dataDir, 'plugins', 'pi-coding-agent', 'index.mjs'),
+      'export const PI_TELEMETRY_PLUGIN_API_VERSION = 1;\nexport default function extension() {}\n',
+    );
+    await expect(doctorPiSdkAgent(dataDir, 'acme-code')).resolves.toMatchObject({
+      runtimePresent: true,
+      runtimeLoadable: false,
+      wrapperPresent: true,
+      wrapperLoadable: false,
+      healthy: false,
+      contractError: 'runtime does not export createPiTelemetryExtension',
+    });
   });
 
   it('requires a dedicated agentDir to prevent duplicate telemetry identities', async () => {
