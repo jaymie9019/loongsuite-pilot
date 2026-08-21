@@ -1,8 +1,17 @@
 import { createHash } from 'node:crypto';
-import type { AgentActivityEntry, JsonValue } from '../../types/index.js';
+import type {
+  AgentActivityEntry,
+  AgentSkillTelemetryConfig,
+  JsonValue,
+} from '../../types/index.js';
 import { ClientType } from '../../types/index.js';
 import { enrichCanonicalEntryWithGit } from '../../normalization/enrich-git-context.js';
 import { usageFromDroidSettings } from './droid-parser.js';
+import {
+  detectDroidSkillActivation,
+  observeDroidSkillRevision,
+  type DroidSkillActivation,
+} from './droid-skill-telemetry.js';
 import type {
   DroidBuildOptions,
   DroidBuildResult,
@@ -51,6 +60,8 @@ interface ToolContext {
   step: StepContext;
   callTimestamp: number;
   spanId: string;
+  callEntry: AgentActivityEntry;
+  skill?: DroidSkillActivation;
 }
 
 interface ResolvedHook extends DroidHookEvent {
@@ -67,6 +78,7 @@ export interface DroidEventBuildOptions extends DroidBuildOptions {
    * diagnostic because an unobserved baseline may contain earlier calls.
    */
   settingsUsageScope?: DroidSettingsUsageScope;
+  skillTelemetry?: AgentSkillTelemetryConfig;
 }
 
 export async function buildDroidEvents(
@@ -168,6 +180,7 @@ export async function buildDroidEvents(
       );
       result['gen_ai.tool.name'] = tool.name;
       result['gen_ai.tool.call.id'] = callId;
+      if (tool.skill) Object.assign(result, tool.skill.attributes);
       result['tool.result.status'] = 'cancelled';
       const duration = boundaryTimestamp - tool.callTimestamp;
       if (duration >= 0) result['gen_ai.tool.call.duration'] = duration;
@@ -251,6 +264,14 @@ export async function buildDroidEvents(
         const failed = block.is_error === true;
         result['tool.result.status'] = failed ? 'failure' : 'success';
         if (failed) result['error.type'] = 'tool_execution_failed';
+        if (tool.skill) {
+          Object.assign(result, tool.skill.attributes);
+          const revision = observeDroidSkillRevision(block.content, failed);
+          if (revision) {
+            Object.assign(tool.callEntry, revision);
+            Object.assign(result, revision);
+          }
+        }
         const duration = resultTimestamp - tool.callTimestamp;
         if (duration >= 0) result['gen_ai.tool.call.duration'] = duration;
         await push(result, record);
@@ -358,6 +379,13 @@ export async function buildDroidEvents(
       call['gen_ai.tool.call.id'] = callId;
       const args = boundedToolJsonValue(block.input);
       if (args !== undefined) call['gen_ai.tool.call.arguments'] = args;
+      const skill = detectDroidSkillActivation({
+        toolName: name,
+        toolCallId: callId,
+        argumentsValue: block.input,
+        config: opts.skillTelemetry,
+      });
+      if (skill) Object.assign(call, skill.attributes);
       await push(call, record);
       tools.set(callId, {
         callId,
@@ -365,6 +393,8 @@ export async function buildDroidEvents(
         step,
         callTimestamp,
         spanId: toolSpanId,
+        callEntry: call,
+        skill,
       });
       const part: DroidMessagePart = { type: 'tool_call', id: callId, name };
       if (args !== undefined) part.arguments = args;

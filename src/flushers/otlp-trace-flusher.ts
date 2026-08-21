@@ -807,7 +807,16 @@ export class OtlpTraceFlusher extends BaseFlusher {
         try {
           result = convertEventLogToTrace(
             sanitized as unknown as EventLogRecord[],
-            { handler, strict: false, passthroughKeys },
+            {
+              handler,
+              strict: false,
+              passthroughKeys,
+              // Droid has a first-class native Skill TOOL. Its transcript
+              // adapter emits explicit exact-evidence fields, so generic
+              // skills/<name> argument matching would only add unmarked false
+              // positives from ordinary Read/Execute calls.
+              ...(agentType === 'droid' ? { skillDetection: false } : {}),
+            },
           );
         } finally {
           toolSpanIds.clear();

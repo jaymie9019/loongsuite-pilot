@@ -105,6 +105,253 @@ function identityProjection(entries: Array<Record<string, unknown>>) {
 }
 
 describe('Droid event builder', () => {
+  it('emits exact Skill identity and loaded-result revision on the native Droid Skill TOOL', async () => {
+    const sessionId = '22222222-3333-4444-8555-666666666666';
+    const turnId = 'native-skill-turn';
+    const toolCallId = 'toolu_native_skill_001';
+    const loadedSkill = '# projex-ticket\nFollow the exact ticket workflow.\n';
+    const { entries } = await buildDroidEvents([{
+      type: 'session_start',
+      id: sessionId,
+      version: 2,
+    }, {
+      type: 'message',
+      id: turnId,
+      timestamp: 1_800_000_001_000,
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text: 'Use the requested Skill.' }],
+      },
+    }, {
+      type: 'message',
+      id: 'native-skill-assistant',
+      parentId: turnId,
+      timestamp: 1_800_000_001_100,
+      message: {
+        role: 'assistant',
+        content: [{
+          type: 'tool_use',
+          id: toolCallId,
+          name: 'Skill',
+          input: { skill: 'projex-ticket' },
+        }],
+      },
+    }, {
+      type: 'message',
+      id: 'native-skill-result',
+      parentId: 'native-skill-assistant',
+      timestamp: 1_800_000_001_180,
+      message: {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: toolCallId,
+          content: loadedSkill,
+          is_error: false,
+        }],
+      },
+    }], {
+      sessionId,
+      skillTelemetry: {
+        enabled: true,
+        mode: 'exact',
+        versionStrategy: 'content_sha256',
+        weakPathHeuristics: false,
+      },
+    });
+
+    const toolCall = entries.find(entry => entry['event.name'] === 'tool.call')!;
+    const toolResult = entries.find(entry => entry['event.name'] === 'tool.result')!;
+    const expectedSkill = {
+      'gen_ai.skill.id': 'projex-ticket',
+      'gen_ai.skill.name': 'projex-ticket',
+      'gen_ai.skill.version': 'sha256:2c8abd5db9e3',
+      'loongsuite.skill.activation_id': toolCallId,
+      'loongsuite.skill.trigger': 'model_tool',
+      'loongsuite.skill.provenance': 'native_skill_tool',
+      'loongsuite.skill.confidence': 'direct',
+      'loongsuite.skill.content_sha256': '2c8abd5db9e31e2b4cb56ca5818af6a216b6a8469f98c5c5ab10a3711af1fd05',
+      'loongsuite.skill.revision_source': 'observed_tool_result',
+    };
+
+    expect(toolCall).toMatchObject({
+      'gen_ai.tool.name': 'Skill',
+      'gen_ai.tool.call.id': toolCallId,
+      ...expectedSkill,
+    });
+    expect(toolResult).toMatchObject({
+      'gen_ai.tool.name': 'Skill',
+      'gen_ai.tool.call.id': toolCallId,
+      'gen_ai.tool.call.duration': 80,
+      'tool.result.status': 'success',
+      ...expectedSkill,
+    });
+    expect(toolCall).not.toHaveProperty('gen_ai.skill.description');
+    expect(entries.filter(entry => entry['gen_ai.skill.name'] !== undefined)).toEqual([
+      toolCall,
+      toolResult,
+    ]);
+  });
+
+  it('keeps Skill identity on the existing TOOL span and rejects Droid path heuristics', async () => {
+    const sessionId = '33333333-4444-4555-8666-777777777777';
+    const turnId = 'native-skill-span-turn';
+    const skillCallId = 'toolu_native_skill_span';
+    const pathCallId = 'toolu_weak_skill_path';
+    const { entries } = await buildDroidEvents([{
+      type: 'session_start', id: sessionId, version: 2,
+    }, {
+      type: 'message', id: turnId, timestamp: 1_800_000_002_000,
+      message: { role: 'user', content: [{ type: 'text', text: 'Use one native Skill and one ordinary tool.' }] },
+    }, {
+      type: 'message', id: 'native-skill-span-assistant', timestamp: 1_800_000_002_100,
+      message: {
+        role: 'assistant',
+        content: [{
+          type: 'tool_use', id: skillCallId, name: 'Skill', input: { skill: 'projex-ticket' },
+        }, {
+          type: 'tool_use', id: pathCallId, name: 'Read', input: { path: '/workspace/skills/not-an-activation/SKILL.md' },
+        }],
+      },
+    }, {
+      type: 'message', id: 'native-skill-span-results', timestamp: 1_800_000_002_180,
+      message: {
+        role: 'user',
+        content: [{
+          type: 'tool_result', tool_use_id: skillCallId, content: '# loaded\n', is_error: false,
+        }, {
+          type: 'tool_result', tool_use_id: pathCallId, content: 'ordinary file', is_error: false,
+        }],
+      },
+    }], {
+      sessionId,
+      skillTelemetry: {
+        enabled: true,
+        mode: 'exact',
+        versionStrategy: 'content_sha256',
+        weakPathHeuristics: false,
+      },
+    });
+
+    const spans = await convertWithPilot(entries);
+    const tools = spans.filter(span => span.attributes['gen_ai.span.kind'] === 'TOOL');
+    expect(tools).toHaveLength(2);
+    expect(tools.filter(span => span.attributes['gen_ai.tool.name'] === 'load_skill')).toHaveLength(0);
+
+    const skill = tools.find(span => span.attributes['gen_ai.tool.call.id'] === skillCallId)!;
+    expect(skill.attributes).toMatchObject({
+      'gen_ai.tool.name': 'Skill',
+      'gen_ai.skill.id': 'projex-ticket',
+      'gen_ai.skill.name': 'projex-ticket',
+      'loongsuite.skill.activation_id': skillCallId,
+      'loongsuite.skill.trigger': 'model_tool',
+      'loongsuite.skill.provenance': 'native_skill_tool',
+      'loongsuite.skill.confidence': 'direct',
+      'loongsuite.skill.revision_source': 'observed_tool_result',
+    });
+
+    const ordinaryRead = tools.find(span => span.attributes['gen_ai.tool.call.id'] === pathCallId)!;
+    expect(ordinaryRead.attributes).not.toHaveProperty('gen_ai.skill.name');
+    expect(ordinaryRead.attributes).not.toHaveProperty('gen_ai.skill.id');
+  });
+
+  it('keeps failed native Skill identity without inventing a revision', async () => {
+    const sessionId = '44444444-5555-4666-8777-888888888888';
+    const toolCallId = 'toolu_failed_native_skill';
+    const { entries } = await buildDroidEvents([{
+      type: 'session_start', id: sessionId, version: 2,
+    }, {
+      type: 'message', id: 'failed-skill-turn', timestamp: 1_800_000_003_000,
+      message: { role: 'user', content: [{ type: 'text', text: 'Try one Skill.' }] },
+    }, {
+      type: 'message', id: 'failed-skill-assistant', timestamp: 1_800_000_003_100,
+      message: {
+        role: 'assistant',
+        content: [{
+          type: 'tool_use', id: toolCallId, name: 'Skill', input: { skill: 'projex-ticket' },
+        }],
+      },
+    }, {
+      type: 'message', id: 'failed-skill-result', timestamp: 1_800_000_003_150,
+      message: {
+        role: 'user',
+        content: [{
+          type: 'tool_result', tool_use_id: toolCallId, content: 'not loaded', is_error: true,
+        }],
+      },
+    }], {
+      sessionId,
+      skillTelemetry: {
+        enabled: true,
+        mode: 'exact',
+        versionStrategy: 'content_sha256',
+        weakPathHeuristics: false,
+      },
+    });
+
+    const skillEntries = entries.filter(entry => entry['gen_ai.skill.name'] !== undefined);
+    expect(skillEntries).toHaveLength(2);
+    expect(skillEntries.every(entry => entry['gen_ai.skill.name'] === 'projex-ticket')).toBe(true);
+    expect(skillEntries.every(entry => entry['loongsuite.skill.activation_id'] === toolCallId)).toBe(true);
+    expect(skillEntries.every(entry => entry['gen_ai.skill.version'] === undefined)).toBe(true);
+    expect(skillEntries.every(entry => entry['loongsuite.skill.content_sha256'] === undefined)).toBe(true);
+    expect(skillEntries.every(entry => entry['loongsuite.skill.revision_source'] === undefined)).toBe(true);
+    expect(skillEntries.find(entry => entry['event.name'] === 'tool.result')).toMatchObject({
+      'tool.result.status': 'failure',
+      'error.type': 'tool_execution_failed',
+    });
+  });
+
+  it('fails closed for disabled policy, malformed Skill names, and Skill-like ordinary tools', async () => {
+    const sessionId = '55555555-6666-4777-8888-999999999999';
+    const records: DroidRecord[] = [{
+      type: 'session_start', id: sessionId, version: 2,
+    }, {
+      type: 'message', id: 'negative-skill-turn', timestamp: 1_800_000_004_000,
+      message: { role: 'user', content: [{ type: 'text', text: 'Exercise negative cases.' }] },
+    }, {
+      type: 'message', id: 'negative-skill-assistant', timestamp: 1_800_000_004_100,
+      message: {
+        role: 'assistant',
+        content: [{
+          type: 'tool_use', id: 'disabled-skill', name: 'Skill', input: { skill: 'projex-ticket' },
+        }, {
+          type: 'tool_use', id: 'malformed-skill', name: 'Skill', input: { skill: 'bad\nname' },
+        }, {
+          type: 'tool_use', id: 'skill-like-tool', name: 'SkillSearch', input: { skill: 'roster' },
+        }, {
+          type: 'tool_use', id: 'padded-tool-name', name: ' Skill ', input: { skill: 'roster' },
+        }],
+      },
+    }, {
+      type: 'message', id: 'negative-skill-results', timestamp: 1_800_000_004_180,
+      message: {
+        role: 'user',
+        content: ['disabled-skill', 'malformed-skill', 'skill-like-tool', 'padded-tool-name']
+          .map(tool_use_id => ({
+            type: 'tool_result', tool_use_id, content: 'result', is_error: false,
+          })),
+      },
+    }];
+
+    const disabled = await buildDroidEvents(records, { sessionId });
+    expect(disabled.entries.every(entry => entry['gen_ai.skill.name'] === undefined)).toBe(true);
+
+    const enabled = await buildDroidEvents(records, {
+      sessionId,
+      skillTelemetry: {
+        enabled: true,
+        mode: 'exact',
+        versionStrategy: 'content_sha256',
+        weakPathHeuristics: false,
+      },
+    });
+    const attributed = enabled.entries.filter(entry => entry['gen_ai.skill.name'] !== undefined);
+    expect(attributed).toHaveLength(2);
+    expect(attributed.every(entry => entry['gen_ai.tool.call.id'] === 'disabled-skill')).toBe(true);
+    expect(attributed.every(entry => entry['gen_ai.skill.name'] === 'projex-ticket')).toBe(true);
+  });
+
   it('builds the sanitized 2-LLM/1-tool golden into a deterministic AgentLoop topology', async () => {
     const { records, settings, observations } = await goldenInputs();
     const first = await buildDroidEvents(records, {

@@ -98,6 +98,10 @@ Pilot 根据上述本地源构建 AgentLoop 的 session/turn/step/LLM/tool 拓�
 结果字段；如果开启，这些内容仍固定经过完整的 Pilot `mode=all` 密钥与 PII
 脱敏规则，即使全局 masking 配置为 `none` 也不会绕过。
 
+Droid 可选的 exact Skill telemetry 只丰富原生 `Skill` tool call/result，并以成功的
+raw tool result 计算 loaded-payload revision。普通 Read、Bash 或路径文本不会归因；
+详见 [Factory Droid Skill telemetry](droid-skill-telemetry.md)。
+
 先以只读方式检查完整历史 turn：
 
 ```bash
@@ -228,7 +232,7 @@ loongsuite-pilot restart
 | `enabled` | 设置为 `false` 可从配置层禁用该 Agent。 |
 | `captureMessageContent` | 设置为 `false` 可避免采集完整 Prompt、Completion、工具参数和工具结果，前提是对应集成支持该策略。 |
 | `multimodal.uploadMode` | 多模态上传策略。`none`（默认）关闭；`input` / `tool` / `output` / `both` 控制转换表面。详见 [多模态采集](multimodal.md)。 |
-| `skillTelemetry` | OMP 的 exact Skill activation 采集策略，默认关闭。详见 [Pi Coding Agent / OMP Skill telemetry](pi-coding-agent-skill-telemetry.md)。 |
+| `skillTelemetry` | OMP 或 Droid 的 exact Skill activation 采集策略，默认关闭。详见 [Pi Coding Agent / OMP Skill telemetry](pi-coding-agent-skill-telemetry.md) 与 [Factory Droid Skill telemetry](droid-skill-telemetry.md)。 |
 
 敏感环境建议同时设置 `captureMessageContent: false` 和 [数据脱敏](masking.md)。需要提取多模态数据时，见 [多模态采集](multimodal.md)（当前仅图像、仅 `codex` 生效）。
 敏感环境建议同时设置 `captureMessageContent: false` 和 [数据脱敏](masking.md)。

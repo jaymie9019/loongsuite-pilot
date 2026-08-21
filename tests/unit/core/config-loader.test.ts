@@ -559,11 +559,29 @@ describe('ConfigLoader', () => {
               weakPathHeuristics: 'false',
             },
           },
+          droid: {
+            captureMessageContent: false,
+            skillTelemetry: {
+              enabled: true,
+              mode: 'exact',
+              versionStrategy: 'content_sha256',
+              weakPathHeuristics: false,
+            },
+          },
         },
       });
 
       const config = await loadConfig();
       expect(config.agents.omp).toEqual({
+        captureMessageContent: false,
+        skillTelemetry: {
+          enabled: true,
+          mode: 'exact',
+          versionStrategy: 'content_sha256',
+          weakPathHeuristics: false,
+        },
+      });
+      expect(config.agents.droid).toEqual({
         captureMessageContent: false,
         skillTelemetry: {
           enabled: true,

@@ -1532,6 +1532,7 @@ export class Orchestrator extends EventEmitter {
       stateStore: this.stateStore,
       hookEventDir: path.join(this.dataDir, 'state', 'droid', 'hook-events'),
       pollIntervalMs: listenerCfg['droid-transcript']?.pollInterval,
+      skillTelemetry: this.config.agents.droid?.skillTelemetry,
     });
     this.inputManager.registerInput(droidInput);
     entries.push(

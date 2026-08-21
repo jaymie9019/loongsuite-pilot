@@ -399,6 +399,60 @@ describe('InputManager', () => {
       expect(serialized).not.toContain(apiKey);
       expect(serialized).not.toContain(email);
     });
+
+    it('keeps Droid exact Skill identity and revision when message content capture is disabled', async () => {
+      const input = new StubInput('droid-transcript');
+      manager.registerInput(input as any);
+      manager.setAgentsConfig({
+        droid: {
+          captureMessageContent: false,
+          skillTelemetry: {
+            enabled: true,
+            mode: 'exact',
+            versionStrategy: 'content_sha256',
+            weakPathHeuristics: false,
+          },
+        },
+      });
+
+      const entry = buildTestEntry({
+        agentType: 'droid' as ClientType,
+        'event.name': 'tool.call',
+        'gen_ai.tool.name': 'Skill',
+        'gen_ai.tool.call.id': 'toolu_private_skill',
+        'gen_ai.tool.call.arguments': {
+          skill: 'projex-ticket',
+          path: '/Users/example/private/SKILL.md',
+        },
+        'gen_ai.skill.id': 'projex-ticket',
+        'gen_ai.skill.name': 'projex-ticket',
+        'gen_ai.skill.version': 'sha256:aaaaaaaaaaaa',
+        'loongsuite.skill.activation_id': 'toolu_private_skill',
+        'loongsuite.skill.trigger': 'model_tool',
+        'loongsuite.skill.provenance': 'native_skill_tool',
+        'loongsuite.skill.confidence': 'direct',
+        'loongsuite.skill.content_sha256': 'a'.repeat(64),
+        'loongsuite.skill.revision_source': 'observed_tool_result',
+      });
+
+      input.emit('entries', [entry]);
+      await new Promise(r => setTimeout(r, 50));
+
+      const dispatched = flusher.batchCalls[0][0];
+      expect(dispatched).toMatchObject({
+        'gen_ai.skill.id': 'projex-ticket',
+        'gen_ai.skill.name': 'projex-ticket',
+        'gen_ai.skill.version': 'sha256:aaaaaaaaaaaa',
+        'loongsuite.skill.activation_id': 'toolu_private_skill',
+        'loongsuite.skill.trigger': 'model_tool',
+        'loongsuite.skill.provenance': 'native_skill_tool',
+        'loongsuite.skill.confidence': 'direct',
+        'loongsuite.skill.content_sha256': 'a'.repeat(64),
+        'loongsuite.skill.revision_source': 'observed_tool_result',
+      });
+      expect(dispatched).not.toHaveProperty('gen_ai.tool.call.arguments');
+      expect(JSON.stringify(dispatched)).not.toContain('/Users/example/private/SKILL.md');
+    });
   });
 
   describe('registerInput deduplication (T032)', () => {

@@ -32,6 +32,7 @@
 | [数据脱敏](masking.md) | 输出前脱敏密钥和个人敏感信息。 |
 | [输出事件 Schema](output-event-schema.md) | 查看规范化事件名称、字段、多模态 uri part、Provider 和结束原因。 |
 | [Pi Coding Agent / OMP Skill telemetry](pi-coding-agent-skill-telemetry.md) | 为 OMP exact Skill activation 配置 AgentLoop TOOL telemetry，并验证完整上报链路。 |
+| [Factory Droid Skill telemetry](droid-skill-telemetry.md) | 将 Droid 原生 `Skill` tool 映射为 exact AgentLoop Skill TOOL telemetry，并验证生产链路。 |
 
 ## 扩展 Pilot
 

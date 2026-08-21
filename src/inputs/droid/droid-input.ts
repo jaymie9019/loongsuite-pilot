@@ -3,7 +3,11 @@ import * as fsSync from 'node:fs';
 import * as path from 'node:path';
 import { homedir } from 'node:os';
 import type { Dirent, FSWatcher } from 'node:fs';
-import type { AgentActivityEntry, InputState } from '../../types/index.js';
+import type {
+  AgentActivityEntry,
+  AgentSkillTelemetryConfig,
+  InputState,
+} from '../../types/index.js';
 import { ClientType, CollectionMethod } from '../../types/index.js';
 import { BaseInput, type InputOptions } from '../base/base-input.js';
 import {
@@ -89,6 +93,7 @@ interface PendingLogEnrichment {
 export interface DroidInputOptions extends InputOptions {
   factoryRoot?: string;
   hookEventDir?: string;
+  skillTelemetry?: AgentSkillTelemetryConfig;
 }
 
 /**
@@ -104,6 +109,7 @@ export class DroidInput extends BaseInput {
   private readonly sessionsDir: string;
   private readonly logsDir: string;
   private readonly hookEventDir: string;
+  private readonly skillTelemetry?: AgentSkillTelemetryConfig;
   private watchers: FSWatcher[] = [];
   private stabilityRetry: ReturnType<typeof setTimeout> | null = null;
   private stagedCheckpointState: Partial<InputState> | undefined;
@@ -118,6 +124,7 @@ export class DroidInput extends BaseInput {
     this.logsDir = path.join(this.factoryRoot, 'logs');
     this.hookEventDir = opts.hookEventDir
       ?? path.join(homedir(), '.loongsuite-pilot', 'state', 'droid', 'hook-events');
+    this.skillTelemetry = opts.skillTelemetry;
   }
 
   static getWatchPaths(root = path.join(homedir(), '.factory')): string[] {
@@ -341,6 +348,7 @@ export class DroidInput extends BaseInput {
           observations: sessionObservations,
           initialUsage: pending.initialUsage,
           settingsUsageScope: pending.settingsUsageScope,
+          skillTelemetry: this.skillTelemetry,
         });
         const graceMeta = nextFileMeta[pending.transcriptPath];
         if (needsNewSessionSettingsGrace(
